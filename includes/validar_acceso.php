@@ -1,0 +1,99 @@
+<?php
+/**
+ * Validación de acceso por roles
+ */
+require_once __DIR__ . '/configuracion_sistema_helper.php';
+
+if (motus_mantenimiento_activo()) {
+    $userRolesMantenimiento = $_SESSION['user_roles'] ?? [];
+    $esAdminMantenimiento = in_array('ROLE_ADMIN', $userRolesMantenimiento, true);
+    if (!$esAdminMantenimiento) {
+        motus_emitir_mantenimiento_html();
+        exit();
+    }
+}
+
+// Verificar si el usuario está logueado
+if (!isset($_SESSION['user_id'])) {
+    header('Location: ../index.php');
+    exit();
+}
+
+require_once __DIR__ . '/banco_scope_helper.php';
+require_once __DIR__ . '/sp_scope_helper.php';
+
+// Obtener roles del usuario
+$userRoles = $_SESSION['user_roles'] ?? [];
+$isAdmin = in_array('ROLE_ADMIN', $userRoles);
+$isGestor = in_array('ROLE_GESTOR', $userRoles);
+$isBanco = motus_es_vista_banco($userRoles);
+$isAdminBanco = motus_es_admin_banco($userRoles);
+$isVendedor = in_array('ROLE_VENDEDOR', $userRoles);
+$isSp = motus_es_vista_sp($userRoles);
+
+// Obtener la página actual
+$current_page = basename($_SERVER['PHP_SELF']);
+
+// Definir páginas permitidas por rol
+$paginasAdmin = ['dashboard.php', 'usuarios.php', 'roles.php', 'bancos.php', 'ejecutivos_ventas.php', 'solicitudes.php', 'historico_solicitudes.php', 'sol_financiamiento.php', 'seguimiento_financiamiento.php', 'subir_reporte_reservas.php', 'ferias.php', 'feria_panel.php', 'configuracion.php', 'reportes.php', 'encuestas_resultados.php', 'seguimiento_usuarios.php', 'monitoreo_seguridad.php'];
+$paginasGestor = ['dashboard.php', 'solicitudes.php', 'historico_solicitudes.php', 'sol_financiamiento.php', 'seguimiento_financiamiento.php', 'subir_reporte_reservas.php', 'ferias.php', 'feria_panel.php', 'usuarios_banco.php', 'ejecutivos_ventas.php', 'reportes.php', 'encuestas_resultados.php'];
+$paginasBanco = ['dashboard.php', 'solicitudes.php', 'historico_solicitudes.php', 'mis_propuestas_banco.php', 'usuarios_banco.php', 'reportes_banco.php', 'reportes_banco_fin_enlazada.php', 'seguimiento_banco.php'];
+$paginasVendedor = ['dashboard.php', 'solicitudes.php', 'historico_solicitudes.php'];
+$paginasSp = ['dashboard.php', 'solicitudes.php', 'historico_solicitudes.php', 'reportes.php', 'seguimiento_financiamiento.php'];
+
+// Función para verificar acceso
+function verificarAcceso($pagina, $roles, $paginasPermitidas) {
+    if (in_array($pagina, $paginasPermitidas)) {
+        return true;
+    }
+    return false;
+}
+
+// Verificar acceso según el rol
+$accesoPermitido = false;
+
+if ($isAdmin) {
+    $accesoPermitido = verificarAcceso($current_page, $userRoles, $paginasAdmin);
+} elseif ($isGestor) {
+    $accesoPermitido = verificarAcceso($current_page, $userRoles, $paginasGestor);
+} elseif ($isBanco) {
+    // ROLE_BANCO y ROLE_ADMIN_BANCO: mismas páginas de banco
+    $accesoPermitido = verificarAcceso($current_page, $userRoles, $paginasBanco);
+} elseif ($isSp) {
+    $accesoPermitido = verificarAcceso($current_page, $userRoles, $paginasSp);
+} elseif ($isVendedor) {
+    $accesoPermitido = verificarAcceso($current_page, $userRoles, $paginasVendedor);
+} else {
+    // Usuario sin roles válidos - permitir acceso al dashboard al menos
+    $accesoPermitido = ($current_page === 'dashboard.php');
+}
+
+// Monitoreo de seguridad: solo admin principal (id=1). Seguimiento de usuarios: id 1 y 25.
+$idAccesoEspecial = (int) ($_SESSION['user_id'] ?? 0);
+if ($current_page === 'monitoreo_seguridad.php') {
+    $accesoPermitido = ($idAccesoEspecial === 1);
+} elseif ($current_page === 'seguimiento_usuarios.php') {
+    $accesoPermitido = in_array($idAccesoEspecial, [1, 25], true);
+}
+
+// Si no tiene acceso, redirigir al dashboard (solo si no estamos ya en el dashboard)
+if (!$accesoPermitido && $current_page !== 'dashboard.php') {
+    header('Location: dashboard.php');
+    exit();
+}
+
+// Telemetría interna: pantalla visitada (usuarios autenticados con acceso OK).
+try {
+    if ($accesoPermitido || $current_page === 'dashboard.php') {
+        if (!isset($pdo) || !($pdo instanceof PDO)) {
+            require_once __DIR__ . '/../config/database.php';
+        }
+        if (isset($pdo) && $pdo instanceof PDO) {
+            require_once __DIR__ . '/usuario_actividad_helper.php';
+            motus_actividad_registrar_page_view($pdo, $current_page);
+        }
+    }
+} catch (Throwable $e) {
+    error_log('validar_acceso actividad: ' . $e->getMessage());
+}
+?>

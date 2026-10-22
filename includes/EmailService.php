@@ -1,0 +1,472 @@
+<?php
+/**
+ * Envío de correos vía Resend (único proveedor).
+ */
+
+$autoloadPath = __DIR__ . '/../vendor/autoload.php';
+if (file_exists($autoloadPath)) {
+    require_once $autoloadPath;
+} else {
+    die('Error: Composer no está instalado. Ejecuta: composer install');
+}
+
+use Resend\Exceptions\ErrorException;
+
+class EmailService {
+    private $config;
+    private const CC_GLOBAL_FIJO = 'fyi@automarketpan.com';
+
+    /** @var int|null ID de solicitudes_credito para CC automático de email_pipedrive */
+    private $solicitudContextoId = null;
+
+    /** Si true, no se agrega el CC global de auditoría (p. ej. recuperación de contraseña). */
+    private $omitirCcGlobal = false;
+
+    public function __construct() {
+        $this->config = require __DIR__ . '/../config/email.php';
+        $nombreCorrecto = 'AutoMarket Seminuevos';
+        foreach (['from_name', 'reply_to_name', 'app_name'] as $key) {
+            if (!empty($this->config[$key]) && (stripos($this->config[$key], 'Rent a Car') !== false || stripos($this->config[$key], 'Automarket Rent') !== false)) {
+                $this->config[$key] = $key === 'reply_to_name' ? $nombreCorrecto . ' - Soporte' : $nombreCorrecto;
+            }
+        }
+
+        $apiKey = trim((string) ($this->config['resend_api_key'] ?? ''));
+        if ($apiKey === '') {
+            throw new RuntimeException('Falta RESEND_API_KEY en .env o variables de entorno.');
+        }
+
+        $base = trim((string) ($this->config['resend_base_url'] ?? 'api.resend.com'));
+        $base = preg_replace('#^https?://#i', '', rtrim($base, '/'));
+        if ($base !== '') {
+            putenv('RESEND_BASE_URL=' . $base);
+            $_ENV['RESEND_BASE_URL'] = $base;
+        }
+    }
+
+    /**
+     * Asocia el envío a una solicitud de crédito: si tiene email_pipedrive, irá en CC.
+     * Usar en envíos futuros: (new EmailService())->paraSolicitud($id)->enviarCorreo(...)
+     */
+    public function paraSolicitud($solicitudId): self {
+        $id = (int) $solicitudId;
+        $this->solicitudContextoId = $id > 0 ? $id : null;
+        return $this;
+    }
+
+    /**
+     * Omite el CC fijo de auditoría (fyi@...). Usar solo en correos sensibles (reset de contraseña).
+     */
+    public function sinCcAuditoria(): self {
+        $this->omitirCcGlobal = true;
+        return $this;
+    }
+
+    /**
+     * @param array $attachments Rutas locales (string) o items ['path' => abs, 'filename' => 'nombre.pdf'] para el nombre en el correo
+     * @param array $cc Lista de correos en copia visible (solo dirección, sin nombre)
+     * @param array $bcc Lista de correos en copia oculta (no visible para el destinatario principal)
+     * @param int|null $solicitudId Si se indica, se agrega email_pipedrive de esa solicitud al CC (si existe)
+     */
+    public function enviarCorreo(
+        $to,
+        $subject,
+        $bodyHTML,
+        $toName = '',
+        $bodyText = '',
+        $attachments = [],
+        array $cc = [],
+        array $bcc = [],
+        $replyToOverride = '',
+        $solicitudId = null
+    ) {
+        try {
+            $sid = null;
+            if ($solicitudId !== null && (int) $solicitudId > 0) {
+                $sid = (int) $solicitudId;
+            } elseif ($this->solicitudContextoId) {
+                $sid = $this->solicitudContextoId;
+            }
+            $cc = $this->mergeCcEmailPipedrive($cc, $sid);
+
+            return $this->enviarCorreoResend($to, $toName, $subject, $bodyHTML, $bodyText, $attachments, $cc, $bcc, $replyToOverride);
+        } catch (Throwable $e) {
+            error_log('Error al enviar correo (Resend): ' . $e->getMessage());
+            return ['success' => false, 'message' => 'Error al enviar correo: ' . $e->getMessage()];
+        }
+    }
+
+    /**
+     * Agrega email_pipedrive al CC si la solicitud lo tiene. Si no hay correo, no cambia el CC.
+     *
+     * @param array<int, string> $cc
+     * @return array<int, string>
+     */
+    private function mergeCcEmailPipedrive(array $cc, ?int $solicitudId, ?string $emailPipeHint = null): array {
+        $pipe = trim((string) ($emailPipeHint ?? ''));
+        if ($pipe === '' && $solicitudId) {
+            $pipe = (string) ($this->obtenerEmailPipedriveSolicitud($solicitudId) ?? '');
+        }
+        if ($pipe === '' || !filter_var($pipe, FILTER_VALIDATE_EMAIL)) {
+            return $cc;
+        }
+        $cc[] = $pipe;
+        return $cc;
+    }
+
+    private function obtenerEmailPipedriveSolicitud(int $solicitudId): ?string {
+        static $cache = [];
+        if (array_key_exists($solicitudId, $cache)) {
+            return $cache[$solicitudId];
+        }
+        try {
+            if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) {
+                $pdo = $GLOBALS['pdo'];
+            } else {
+                require_once __DIR__ . '/../config/database.php';
+                if (!isset($pdo) || !($pdo instanceof PDO)) {
+                    $cache[$solicitudId] = null;
+                    return null;
+                }
+                $GLOBALS['pdo'] = $pdo;
+            }
+            $st = $pdo->prepare('SELECT email_pipedrive FROM solicitudes_credito WHERE id = ? LIMIT 1');
+            $st->execute([$solicitudId]);
+            $row = $st->fetch(PDO::FETCH_ASSOC);
+            $email = trim((string) ($row['email_pipedrive'] ?? ''));
+            $cache[$solicitudId] = ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) ? $email : null;
+        } catch (Throwable $e) {
+            error_log('obtenerEmailPipedriveSolicitud: ' . $e->getMessage());
+            $cache[$solicitudId] = null;
+        }
+        return $cache[$solicitudId];
+    }
+
+    private function mensajeErrorResend(string $raw): string {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return 'Error Resend: respuesta vacía';
+        }
+        if (stripos($raw, 'only send testing emails') !== false
+            || stripos($raw, 'verify a domain') !== false) {
+            return 'Resend (modo prueba): con onboarding@resend.dev solo puedes enviar a tu propio correo. '
+                . 'Para notificar a bancos u otros destinatarios, verifica un dominio en https://resend.com/domains '
+                . 'y configura MAIL_FROM_EMAIL (y opcionalmente MAIL_REPLY_TO) con una dirección de ese dominio. '
+                . 'Detalle: ' . $raw;
+        }
+        return 'Error Resend: ' . $raw;
+    }
+
+    private function enviarCorreoResend($to, $toName, $subject, $bodyHTML, $bodyText, $attachments, array $cc = [], array $bcc = [], $replyToOverride = '') {
+        $apiKey = trim((string) ($this->config['resend_api_key'] ?? ''));
+        $fromName = trim((string) ($this->config['from_name'] ?? ''));
+        $fromEmail = trim((string) ($this->config['from_email'] ?? ''));
+        $from = $fromName !== '' ? ($fromName . ' <' . $fromEmail . '>') : $fromEmail;
+
+        $toAddr = trim((string) $to);
+        $params = [
+            'from' => $from,
+            'to' => $toName !== '' ? [$toName . ' <' . $toAddr . '>'] : [$toAddr],
+            'subject' => $subject,
+            'html' => $bodyHTML,
+            'text' => $bodyText !== '' ? $bodyText : strip_tags($bodyHTML),
+        ];
+
+        // CC global de auditoría (salvo correos sensibles como recuperación de contraseña).
+        $ccConGlobal = $cc;
+        if (!$this->omitirCcGlobal) {
+            $ccConGlobal[] = self::CC_GLOBAL_FIJO;
+        }
+        $ccList = $this->normalizarListaCorreosCc($ccConGlobal, $toAddr, $fromEmail);
+        if ($ccList !== []) {
+            $params['cc'] = $ccList;
+        }
+
+        $bccList = $this->normalizarListaCorreosCc($bcc, $toAddr, $fromEmail);
+        if ($bccList !== []) {
+            $params['bcc'] = $bccList;
+        }
+
+        $replyTo = trim((string)$replyToOverride);
+        if ($replyTo === '') {
+            $replyTo = trim((string) ($this->config['reply_to_email'] ?? ''));
+        }
+        if ($replyTo !== '') {
+            $params['reply_to'] = $replyTo;
+        }
+
+        if (!empty($attachments)) {
+            $atts = [];
+            foreach ($attachments as $item) {
+                $path = null;
+                $filename = null;
+                $contentId = null;
+                $contentType = null;
+                if (is_string($item)) {
+                    $path = $item;
+                    $filename = basename($path);
+                } elseif (is_array($item) && !empty($item['path']) && is_string($item['path'])) {
+                    $path = $item['path'];
+                    $filename = (!empty($item['filename']) && is_string($item['filename']))
+                        ? $item['filename']
+                        : basename($path);
+                    if (!empty($item['content_id']) && is_string($item['content_id'])) {
+                        $contentId = trim($item['content_id']);
+                    }
+                    if (!empty($item['content_type']) && is_string($item['content_type'])) {
+                        $contentType = trim($item['content_type']);
+                    }
+                }
+                if ($path === null || !is_file($path) || !is_readable($path)) {
+                    continue;
+                }
+                $content = @file_get_contents($path);
+                if ($content === false) {
+                    continue;
+                }
+                $row = [
+                    'filename' => $filename,
+                    'content' => base64_encode($content),
+                ];
+                if ($contentId !== null && $contentId !== '') {
+                    $row['content_id'] = $contentId;
+                }
+                if ($contentType !== null && $contentType !== '') {
+                    $row['content_type'] = $contentType;
+                }
+                $atts[] = $row;
+            }
+            if ($atts !== []) {
+                $params['attachments'] = $atts;
+            }
+        }
+
+        try {
+            $client = Resend::client($apiKey);
+            $result = $client->emails->send($params);
+            return [
+                'success' => true,
+                'message' => 'Correo enviado correctamente',
+                'provider' => 'resend',
+                'id' => $result->id ?? null,
+            ];
+        } catch (ErrorException $e) {
+            return [
+                'success' => false,
+                'message' => $this->mensajeErrorResend($e->getMessage()),
+                'provider' => 'resend',
+            ];
+        }
+    }
+
+    /**
+     * @param array<int, string> $cc
+     * @return list<string>
+     */
+    private function normalizarListaCorreosCc(array $cc, string $toPrincipal, string $fromEmail): array {
+        $toLower = strtolower($toPrincipal);
+        $fromLower = strtolower(trim($fromEmail));
+        $seen = [];
+        $out = [];
+        foreach ($cc as $raw) {
+            if (!is_string($raw)) {
+                continue;
+            }
+            $e = trim($raw);
+            if ($e === '' || !filter_var($e, FILTER_VALIDATE_EMAIL)) {
+                continue;
+            }
+            $k = strtolower($e);
+            if ($k === $toLower || ($fromLower !== '' && $k === $fromLower)) {
+                continue;
+            }
+            if (isset($seen[$k])) {
+                continue;
+            }
+            $seen[$k] = true;
+            $out[] = $e;
+        }
+        return $out;
+    }
+
+    public function enviarTemplate($to, $toName, $template, $data = []) {
+        $templatePath = __DIR__ . '/../templates/email/' . $template . '.php';
+
+        if (!file_exists($templatePath)) {
+            return [
+                'success' => false,
+                'message' => "Template no encontrado: {$template}",
+            ];
+        }
+
+        extract($data);
+
+        ob_start();
+        include $templatePath;
+        $bodyHTML = ob_get_clean();
+
+        $bodyText = strip_tags($bodyHTML);
+        $subject = $data['subject'] ?? 'Notificación de AutoMarket Seminuevos';
+
+        $solicitudId = null;
+        if (!empty($data['solicitud']['id'])) {
+            $solicitudId = (int) $data['solicitud']['id'];
+        } elseif (!empty($data['solicitud_id'])) {
+            $solicitudId = (int) $data['solicitud_id'];
+        }
+
+        // Si el array de solicitud ya trae el pipe, evitar una consulta extra.
+        $pipeHint = null;
+        if (!empty($data['solicitud']['email_pipedrive'])) {
+            $pipeHint = trim((string) $data['solicitud']['email_pipedrive']);
+        }
+
+        $cc = [];
+        if (!empty($data['cc']) && is_array($data['cc'])) {
+            $cc = $data['cc'];
+        }
+        if ($pipeHint !== null && $pipeHint !== '') {
+            $cc = $this->mergeCcEmailPipedrive($cc, null, $pipeHint);
+        }
+
+        return $this->enviarCorreo($to, $subject, $bodyHTML, $toName, $bodyText, [], $cc, [], '', $solicitudId);
+    }
+
+    public function notificarVendedorBancoResponde($vendedorEmail, $vendedorNombre, $solicitud) {
+        $sid = (int) ($solicitud['id'] ?? 0);
+        $banco = trim((string) ($solicitud['banco_nombre'] ?? ''));
+        $respuesta = trim((string) ($solicitud['respuesta_banco'] ?? ''));
+        $subject = 'Respuesta del Banco';
+        if ($banco !== '') {
+            $subject .= ' (' . $banco . ')';
+        }
+        if ($respuesta !== '') {
+            $subject .= ' — ' . $respuesta;
+        }
+        $subject .= ' — Solicitud #' . $sid . ' — MOTUS';
+
+        return $this->enviarTemplate(
+            $vendedorEmail,
+            $vendedorNombre,
+            'notificacion_banco_responde',
+            [
+                'subject' => $subject,
+                'vendedor_nombre' => $vendedorNombre,
+                'solicitud' => $solicitud,
+                'app_url' => $this->config['app_url'],
+            ]
+        );
+    }
+
+    public function enviarRecordatorioBanco($bancoEmail, $bancoNombre, $solicitud) {
+        return $this->enviarTemplate(
+            $bancoEmail,
+            $bancoNombre,
+            'recordatorio_banco',
+            [
+                'subject' => 'Recordatorio: Solicitud Pendiente #' . $solicitud['id'],
+                'banco_nombre' => $bancoNombre,
+                'solicitud' => $solicitud,
+                'app_url' => $this->config['app_url'],
+            ]
+        );
+    }
+
+    public function notificarBancoNuevaSolicitud($bancoEmail, $bancoNombre, $solicitud) {
+        return $this->enviarTemplate(
+            $bancoEmail,
+            $bancoNombre,
+            'notificacion_nueva_solicitud',
+            [
+                'subject' => 'Nueva Solicitud Asignada #' . $solicitud['id'],
+                'banco_nombre' => $bancoNombre,
+                'solicitud' => $solicitud,
+                'app_url' => $this->config['app_url'],
+            ]
+        );
+    }
+
+    public function notificarClienteAprobacion($clienteEmail, $clienteNombre, $solicitud, array $cc = []) {
+        $esPreaprobada = (($solicitud['evaluacion_decision'] ?? '') === 'preaprobado');
+        $estadoCorreo = $esPreaprobada ? 'Preaprobada' : 'Aprobada';
+        return $this->enviarTemplate(
+            $clienteEmail,
+            $clienteNombre,
+            'notificacion_cliente_aprobacion',
+            [
+                'subject' => '¡Felicitaciones! Su solicitud ha sido ' . $estadoCorreo,
+                'cliente_nombre' => $clienteNombre,
+                'solicitud' => $solicitud,
+                'app_url' => $this->config['app_url'],
+                'cc' => $cc,
+            ]
+        );
+    }
+
+    public function notificarGestorCambioEstado($gestorEmail, $gestorNombre, $solicitud, $estadoAnterior, $estadoNuevo) {
+        return $this->enviarTemplate(
+            $gestorEmail,
+            $gestorNombre,
+            'notificacion_cambio_estado',
+            [
+                'subject' => 'Cambio de Estado - Solicitud #' . $solicitud['id'],
+                'gestor_nombre' => $gestorNombre,
+                'solicitud' => $solicitud,
+                'estado_anterior' => $estadoAnterior,
+                'estado_nuevo' => $estadoNuevo,
+                'app_url' => $this->config['app_url'],
+            ]
+        );
+    }
+
+    public function notificarReevaluacion($bancoEmail, $bancoNombre, $solicitud, $comentario, $gestorNombre = '', array $evaluacion = []) {
+        $sid = (int) ($solicitud['id'] ?? 0);
+        $cliente = trim((string) ($solicitud['nombre_cliente'] ?? ''));
+        $subject = 'Reevaluación solicitada — Solicitud #' . $sid;
+        if ($cliente !== '') {
+            $subject .= ' — ' . $cliente;
+        }
+        $subject .= ' — MOTUS';
+
+        return $this->enviarTemplate(
+            $bancoEmail,
+            $bancoNombre,
+            'notificacion_reevaluacion',
+            [
+                'subject' => $subject,
+                'banco_nombre' => $bancoNombre,
+                'gestor_nombre' => $gestorNombre,
+                'solicitud' => $solicitud,
+                'evaluacion' => $evaluacion,
+                'comentario' => $comentario,
+                'app_url' => $this->config['app_url'],
+            ]
+        );
+    }
+
+    public function notificarPropuestaSeleccionada($bancoEmail, $bancoNombre, $solicitud, $comentario, $gestorNombre = '', array $evaluacion = [], $criterio = '') {
+        $sid = (int) ($solicitud['id'] ?? 0);
+        $cliente = trim((string) ($solicitud['nombre_cliente'] ?? ''));
+        $subject = 'Propuesta seleccionada — Solicitud #' . $sid;
+        if ($cliente !== '') {
+            $subject .= ' — ' . $cliente;
+        }
+        $subject .= ' — MOTUS';
+
+        return $this->enviarTemplate(
+            $bancoEmail,
+            $bancoNombre,
+            'notificacion_propuesta_seleccionada',
+            [
+                'subject' => $subject,
+                'banco_nombre' => $bancoNombre,
+                'gestor_nombre' => $gestorNombre,
+                'solicitud' => $solicitud,
+                'evaluacion' => $evaluacion,
+                'comentario' => $comentario,
+                'criterio' => $criterio,
+                'app_url' => $this->config['app_url'],
+            ]
+        );
+    }
+}

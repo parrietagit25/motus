@@ -1,0 +1,3649 @@
+<?php
+session_start();
+// Verificar si el usuario está logueado
+if (!isset($_SESSION['user_id'])) {
+    header('Location: index.php');
+    exit();
+}
+
+require_once 'config/database.php';
+require_once 'includes/validar_acceso.php';
+require_once 'includes/solicitud_vehiculo_helper.php';
+require_once 'includes/banco_scope_helper.php';
+require_once 'includes/sp_scope_helper.php';
+
+// Vista histórica: Completada, Rechazada, Desistimiento
+$esHistorico = defined('MOTUS_VISTA_HISTORICO') && MOTUS_VISTA_HISTORICO;
+$estadosHistoricoSql = "'Completada', 'Rechazada', 'Desistimiento'";
+
+// Obtener roles del usuario para restricciones
+$userRoles = $_SESSION['user_roles'] ?? [];
+$isAdmin = in_array('ROLE_ADMIN', $userRoles);
+$isGestor = in_array('ROLE_GESTOR', $userRoles);
+$isAdminBanco = motus_es_admin_banco($userRoles);
+$isBancoAnalista = motus_es_analista_banco($userRoles);
+$isBanco = motus_es_vista_banco($userRoles);
+$isSp = motus_es_vista_sp($userRoles);
+$esUsuarioBancoLista = $isBanco && !$isAdmin; // Vista lista tipo banco (sin columna «todos los bancos» de admin)
+$bancoIdSesion = motus_obtener_banco_id_usuario($pdo);
+
+// Ejecutivos de ventas para el select (Datos Generales)
+$ejecutivosVentas = [];
+try {
+    $stmtEj = $pdo->query("SELECT id, nombre, sucursal, email FROM ejecutivos_ventas WHERE activo = 1 ORDER BY sucursal, nombre");
+    $ejecutivosVentas = $stmtEj->fetchAll(PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    try {
+        $stmtEj = $pdo->query("SELECT id, nombre, sucursal, email FROM ejecutivos_ventas ORDER BY sucursal, nombre");
+        $ejecutivosVentas = $stmtEj->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e2) {
+        error_log('Error cargando ejecutivos_ventas: ' . $e2->getMessage());
+    }
+}
+
+// Filtro de estado (activas vs histórico). Las archivadas van al histórico sin cambiar su estado.
+$filtroEstadoLista = $esHistorico
+    ? "(estado IN ($estadosHistoricoSql) OR archivada = 1)"
+    : "(estado NOT IN ($estadosHistoricoSql) AND archivada = 0)";
+
+// Estados activos (orden de flujo) y de histórico para las tarjetas
+$estadosActivosTarjetas = [
+    'Nueva',
+    'En Revisión Banco',
+    'Reevaluación por los Bancos',
+    'Evaluacion',
+    'Comité',
+    'Reconsideración',
+    'Pre Aprobado',
+    'Aprobado con Condición',
+    'Pend. Firma',
+    'Pend. Poliza',
+    'Pend. Abono',
+    'Pend. Abono y poliza',
+    'Pend. CPP',
+    'Aprobada',
+];
+$estadosHistoricoTarjetas = ['Completada', 'Rechazada', 'Desistimiento'];
+
+$statsGradientes = [
+    'Total' => 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+    'Nueva' => 'linear-gradient(135deg, #6c5ce7 0%, #a29bfe 100%)',
+    'En Revisión Banco' => 'linear-gradient(135deg, #fdcb6e 0%, #e17055 100%)',
+    'Reevaluación por los Bancos' => 'linear-gradient(135deg, #f6d365 0%, #fda085 100%)',
+    'Evaluacion' => 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
+    'Comité' => 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
+    'Reconsideración' => 'linear-gradient(135deg, #43e97b 0%, #38f9d7 100%)',
+    'Pre Aprobado' => 'linear-gradient(135deg, #00b894 0%, #55efc4 100%)',
+    'Aprobado con Condición' => 'linear-gradient(135deg, #00cec9 0%, #81ecec 100%)',
+    'Pend. Firma' => 'linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%)',
+    'Pend. Poliza' => 'linear-gradient(135deg, #89f7fe 0%, #66a6ff 100%)',
+    'Pend. Abono' => 'linear-gradient(135deg, #fa709a 0%, #fee140 100%)',
+    'Pend. Abono y poliza' => 'linear-gradient(135deg, #ff9a9e 0%, #fecfef 100%)',
+    'Pend. CPP' => 'linear-gradient(135deg, #c79081 0%, #dfa579 100%)',
+    'Aprobada' => 'linear-gradient(135deg, #11998e 0%, #38ef7d 100%)',
+    'Completada' => 'linear-gradient(135deg, #2d3436 0%, #636e72 100%)',
+    'Rechazada' => 'linear-gradient(135deg, #e84393 0%, #fd79a8 100%)',
+    'Desistimiento' => 'linear-gradient(135deg, #636e72 0%, #b2bec3 100%)',
+];
+
+// Alcance por rol (banco / gestor / admin)
+$filtroAlcanceStats = '';
+$filtroAlcanceStatsParams = [];
+if ($isBanco && !$isAdmin) {
+    if ($isAdminBanco) {
+        $bancoIdFiltro = (int) ($bancoIdSesion ?? 0);
+        if ($bancoIdFiltro > 0) {
+            $filtroAlcanceStats = "AND EXISTS (
+                SELECT 1 FROM usuarios_banco_solicitudes ubs
+                INNER JOIN usuarios u_banco ON u_banco.id = ubs.usuario_banco_id
+                WHERE ubs.solicitud_id = solicitudes_credito.id
+                AND ubs.estado = 'activo'
+                AND u_banco.banco_id = {$bancoIdFiltro}
+            )";
+        } else {
+            $filtroAlcanceStats = "AND 1=0";
+        }
+    } else {
+        $filtroAlcanceStats = "AND EXISTS (
+            SELECT 1 FROM usuarios_banco_solicitudes ubs
+            WHERE ubs.solicitud_id = solicitudes_credito.id
+            AND ubs.usuario_banco_id = " . (int) $_SESSION['user_id'] . "
+            AND ubs.estado = 'activo'
+        )";
+    }
+} elseif ($isGestor && !$isAdmin) {
+    $filtroAlcanceStats = "AND gestor_id = " . (int) $_SESSION['user_id'];
+} elseif ($isSp && !$isAdmin) {
+    [$filtroAlcanceStats, $filtroAlcanceStatsParams] = motus_sql_filtro_alcance_sp(
+        $pdo,
+        $userRoles,
+        'solicitudes_credito.id'
+    );
+}
+
+$conteoPorEstado = [];
+$stmt = $pdo->prepare("
+    SELECT estado, COUNT(*) AS total
+    FROM solicitudes_credito
+    WHERE $filtroEstadoLista $filtroAlcanceStats
+    GROUP BY estado
+");
+$stmt->execute($filtroAlcanceStatsParams);
+foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $fila) {
+    $conteoPorEstado[$fila['estado']] = (int) $fila['total'];
+}
+
+$totalSolicitudes = array_sum($conteoPorEstado);
+
+// Tarjetas a mostrar: bancos ven resumen fijo; resto ve todos los estados de la vista
+$statsTarjetas = [];
+if ($isBanco && !$isAdmin) {
+    // Conteos en todo el alcance del banco (activas + histórico) para el resumen
+    $conteoBancoFull = [];
+    $stmt = $pdo->query("
+        SELECT estado, COUNT(*) AS total
+        FROM solicitudes_credito
+        WHERE 1=1 $filtroAlcanceStats
+        GROUP BY estado
+    ");
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $fila) {
+        $conteoBancoFull[$fila['estado']] = (int) $fila['total'];
+    }
+    $totalBanco = array_sum($conteoBancoFull);
+    $enRevisionBanco = ($conteoBancoFull['En Revisión Banco'] ?? 0)
+        + ($conteoBancoFull['Reevaluación por los Bancos'] ?? 0);
+
+    $statsTarjetas = [
+        [
+            'label' => 'Total de solicitudes',
+            'count' => $totalBanco,
+            'gradient' => $statsGradientes['Total'],
+        ],
+        [
+            'label' => 'En revisión',
+            'count' => $enRevisionBanco,
+            'gradient' => $statsGradientes['En Revisión Banco'],
+        ],
+        [
+            'label' => 'Pre Aprobadas',
+            'count' => $conteoBancoFull['Pre Aprobado'] ?? 0,
+            'gradient' => $statsGradientes['Pre Aprobado'],
+        ],
+        [
+            'label' => 'Aprobadas',
+            'count' => $conteoBancoFull['Aprobada'] ?? 0,
+            'gradient' => $statsGradientes['Aprobada'],
+        ],
+        [
+            'label' => 'Completadas',
+            'count' => $conteoBancoFull['Completada'] ?? 0,
+            'gradient' => $statsGradientes['Completada'],
+        ],
+    ];
+} else {
+    $statsTarjetas[] = [
+        'label' => $esHistorico ? 'Total en histórico' : 'Total Solicitudes',
+        'count' => $totalSolicitudes,
+        'gradient' => $statsGradientes['Total'],
+    ];
+    $estadosBaseTarjetas = $esHistorico ? $estadosHistoricoTarjetas : $estadosActivosTarjetas;
+    $estadosExtra = array_diff(array_keys($conteoPorEstado), $estadosBaseTarjetas);
+    sort($estadosExtra);
+    foreach (array_merge($estadosBaseTarjetas, array_values($estadosExtra)) as $estadoTarjeta) {
+        $statsTarjetas[] = [
+            'label' => $estadoTarjeta,
+            'count' => $conteoPorEstado[$estadoTarjeta] ?? 0,
+            'gradient' => $statsGradientes[$estadoTarjeta] ?? 'linear-gradient(135deg, #636e72 0%, #b2bec3 100%)',
+        ];
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?php echo $esHistorico ? 'Histórico de Solicitudes' : 'Solicitudes de Crédito'; ?> - Solicitud de Crédito</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/select2@4.0.13/dist/css/select2.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/select2-bootstrap-5-theme@1.3.0/dist/select2-bootstrap-5-theme.min.css" rel="stylesheet">
+    <style>
+        .sidebar {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+        }
+        .sidebar .nav-link {
+            color: #ecf0f1;
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin: 5px 10px;
+            transition: all 0.3s ease;
+        }
+        .sidebar .nav-link:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            transform: translateX(5px);
+        }
+        .sidebar .nav-link.active {
+            background: #3498db;
+            color: #fff;
+        }
+        .main-content {
+            background: #f8f9fa;
+            min-height: 100vh;
+        }
+        #modalEventoCitaFirma { z-index: 1065; }
+        .card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+        }
+        .btn-action {
+            margin: 0 2px;
+            border-radius: 8px;
+        }
+        .modal-header {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            color: white;
+            border-radius: 15px 15px 0 0;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+            gap: 12px;
+            margin-bottom: 1.5rem;
+        }
+        .stats-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 12px;
+            padding: 14px 12px;
+            margin-bottom: 0;
+            min-height: 92px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+        }
+        .stats-card.stats-card-total {
+            grid-column: span 1;
+        }
+        .stats-number {
+            font-size: 1.75rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+            line-height: 1.1;
+        }
+        .stats-label {
+            font-size: 0.78rem;
+            opacity: 0.95;
+            line-height: 1.25;
+            word-break: break-word;
+        }
+        @media (min-width: 1200px) {
+            .stats-grid {
+                grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            }
+        }
+        .badge-estado {
+            font-size: 0.85em;
+            padding: 6px 10px;
+        }
+        .estado-nueva { background: linear-gradient(135deg, #6c5ce7 0%, #a29bfe 100%); }
+        .estado-revision { background: linear-gradient(135deg, #fdcb6e 0%, #e17055 100%); }
+        .estado-aprobada { background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); }
+        .estado-rechazada { background: linear-gradient(135deg, #e84393 0%, #fd79a8 100%); }
+        .estado-completada { background: linear-gradient(135deg, #2d3436 0%, #636e72 100%); }
+        .estado-desistimiento { background: linear-gradient(135deg, #636e72 0%, #b2bec3 100%); }
+        /* Enviada a banco hace 2+ horas sin ninguna evaluación registrada. */
+        #solicitudesTable tbody tr.solicitud-sin-respuesta-2h > td {
+            background-color: #f8d7da !important;
+        }
+        #solicitudesTable tbody tr.solicitud-sin-respuesta-2h:hover > td {
+            background-color: #f1bfc4 !important;
+        }
+        /* Solicitud en estado Aprobada */
+        #solicitudesTable tbody tr.solicitud-estado-aprobada > td {
+            background-color: #d1e7dd !important;
+        }
+        #solicitudesTable tbody tr.solicitud-estado-aprobada:hover > td {
+            background-color: #c3e6cb !important;
+        }
+        /* Pestaña Detalles (resumen enviado a bancos) */
+        .resumen-solicitud-detalles h3 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin: 0.75rem 0 0.25rem;
+        }
+        .resumen-solicitud-detalles h3:first-child { margin-top: 0; }
+        .resumen-solicitud-detalles p { margin-bottom: 0.25rem; }
+        .resumen-solicitud-detalles ul { margin-bottom: 0; }
+
+        /* Respuestas de los Bancos: tabla legible con scroll horizontal (solo DataTables) */
+        .modal-respuestas-bancos .modal-dialog {
+            max-width: min(98vw, 1900px);
+            width: 98vw;
+            margin: 0.75rem auto;
+        }
+        .modal-respuestas-bancos .modal-body {
+            overflow-x: hidden;
+        }
+        .respuestas-banco-wrap {
+            width: 100%;
+            overflow-x: hidden;
+        }
+        /* Evitar barra extra del wrapper de DataTables + contenedor externo */
+        .modal-respuestas-bancos .dataTables_wrapper {
+            overflow-x: hidden;
+        }
+        .modal-respuestas-bancos .dataTables_scroll {
+            overflow-x: auto;
+        }
+        .modal-respuestas-bancos .dataTables_scrollBody {
+            overflow-x: auto !important;
+        }
+        table.table-respuestas-banco {
+            width: max-content !important;
+            min-width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+        }
+        table.table-respuestas-banco thead th {
+            white-space: nowrap;
+            vertical-align: middle !important;
+            padding: 0.75rem 1rem !important;
+            font-size: 0.82rem;
+            font-weight: 600;
+            background: #f1f3f5;
+            border-bottom: 2px solid #dee2e6;
+        }
+        table.table-respuestas-banco tbody td {
+            white-space: nowrap;
+            vertical-align: middle !important;
+            padding: 0.75rem 1rem !important;
+            font-size: 0.875rem;
+            line-height: 1.4;
+            border-color: #e9ecef;
+        }
+        table.table-respuestas-banco td.celda-comentario,
+        table.table-respuestas-banco th.celda-comentario {
+            white-space: normal;
+            min-width: 260px;
+            max-width: 340px;
+        }
+        table.table-respuestas-banco .celda-comentario-inner {
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.4;
+            max-height: none;
+            overflow: visible;
+        }
+        table.table-respuestas-banco .celda-resp-val {
+            display: inline-block;
+            line-height: 1.4;
+        }
+        table.table-respuestas-banco .btn-group-vertical .btn {
+            white-space: nowrap;
+        }
+        
+        /* Estilos para adjuntos */
+        .adjunto-item {
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            transition: all 0.3s ease;
+        }
+        .adjunto-item:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+        .adjunto-icon {
+            font-size: 2rem;
+            margin-right: 15px;
+        }
+        .adjunto-info {
+            flex: 1;
+        }
+        .adjunto-acciones {
+            display: flex;
+            gap: 5px;
+        }
+        .tipo-archivo {
+            font-size: 0.8rem;
+            color: #6c757d;
+        }
+        .tamaño-archivo {
+            font-size: 0.8rem;
+            color: #6c757d;
+        }
+        .fecha-adjunto {
+            font-size: 0.8rem;
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <?php include 'includes/sidebar.php'; ?>
+
+            <!-- Main Content -->
+            <div class="col-md-9 col-lg-10 main-content">
+                <div class="container-fluid py-4">
+                    <!-- Header -->
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h2 class="mb-1"><?php echo $esHistorico ? 'Histórico de Solicitudes' : 'Solicitudes de Crédito'; ?></h2>
+                            <p class="text-muted mb-0"><?php echo $esHistorico
+                                ? 'Solicitudes completadas, rechazadas o en desistimiento'
+                                : 'Gestión de solicitudes de crédito vehicular'; ?></p>
+                        </div>
+                        <?php if (!$esHistorico && (in_array('ROLE_GESTOR', $userRoles) || in_array('ROLE_ADMIN', $userRoles))): ?>
+                        <div class="btn-group">
+                            <button class="btn btn-success" data-bs-toggle="modal" data-bs-target="#solicitudModal" onclick="limpiarFormularioSolicitud()">
+                                <i class="fas fa-plus me-2"></i>Nueva Solicitud
+                            </button>
+                            <button class="btn btn-info" data-bs-toggle="modal" data-bs-target="#infoModal">
+                                <i class="fas fa-info-circle me-2"></i>Info
+                            </button>
+                            <button type="button" class="btn btn-primary" id="btnAutosDisponibles" data-bs-toggle="modal" data-bs-target="#autosDisponiblesModal">
+                                <i class="fas fa-car me-2"></i>Autos disponibles
+                            </button>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- Estadísticas por estado -->
+                    <div class="stats-grid">
+                        <?php foreach ($statsTarjetas as $tarjeta): ?>
+                        <div class="stats-card text-center" style="background: <?php echo htmlspecialchars($tarjeta['gradient']); ?>;">
+                            <div class="stats-number"><?php echo (int) $tarjeta['count']; ?></div>
+                            <div class="stats-label"><?php echo htmlspecialchars($tarjeta['label']); ?></div>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <!-- Tabla de Solicitudes -->
+                    <div class="card">
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table id="solicitudesTable" class="table table-striped table-hover">
+                                    <thead>
+                                        <tr>
+                                            <th<?php echo $isAdmin ? ' title="Clic en el número para ver la cronología (solo administrador)"' : ''; ?>>ID</th>
+                                            <th>Cliente</th>
+                                            <?php if ($esUsuarioBancoLista): ?>
+                                            <th>Cédula</th>
+                                            <th>Estado</th>
+                                            <th>Mis respuestas</th>
+                                            <?php endif; ?>
+                                            <th>Vehículo</th>
+                                            <th>Gestor</th>
+                                            <th>Vendedor</th>
+                                            <?php if (!$isBanco): ?>
+                                            <th>Banco Asignado</th>
+                                            <?php if (!$esUsuarioBancoLista): ?>
+                                            <th>Respuestas del Banco</th>
+                                            <?php endif; ?>
+                                            <?php endif; ?>
+                                            <?php if (!$esUsuarioBancoLista): ?>
+                                            <th>Estado</th>
+                                            <?php endif; ?>
+                                            <!-- <th>Respuesta Banco</th> -->
+                                            <th>Fecha</th>
+                                            <th>Acciones</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php
+                                                                                  // Cargar solicitudes directamente desde PHP
+                                          // Construir consulta con filtro según el rol del usuario
+                                          $sql = "
+                                              SELECT s.*, 
+                                                     u.nombre as gestor_nombre, u.apellido as gestor_apellido,
+                                                     ev.nombre as vendedor_nombre,
+                                                     (SELECT COUNT(*) FROM usuarios_banco_solicitudes WHERE solicitud_id = s.id AND estado = 'activo') as total_usuarios_banco,
+                                                     (SELECT MIN(ubs_alerta.fecha_asignacion)
+                                                      FROM usuarios_banco_solicitudes ubs_alerta
+                                                      WHERE ubs_alerta.solicitud_id = s.id) as fecha_primer_envio_banco,
+                                                     (SELECT COUNT(*)
+                                                      FROM evaluaciones_banco eb_alerta
+                                                      WHERE eb_alerta.solicitud_id = s.id) as total_respuestas_banco,
+                                                     CASE
+                                                         WHEN EXISTS (
+                                                             SELECT 1 FROM usuarios_banco_solicitudes ubs_alerta
+                                                             WHERE ubs_alerta.solicitud_id = s.id
+                                                         )
+                                                         AND NOT EXISTS (
+                                                             SELECT 1 FROM evaluaciones_banco eb_alerta
+                                                             WHERE eb_alerta.solicitud_id = s.id
+                                                         )
+                                                         AND (
+                                                             SELECT MIN(ubs_alerta.fecha_asignacion)
+                                                             FROM usuarios_banco_solicitudes ubs_alerta
+                                                             WHERE ubs_alerta.solicitud_id = s.id
+                                                         ) <= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+                                                         THEN 1 ELSE 0
+                                                     END as alerta_sin_respuesta_2h,
+                                                     s.evaluacion_seleccionada,
+                                                     (SELECT ubs.usuario_banco_id FROM evaluaciones_banco e 
+                                                      INNER JOIN usuarios_banco_solicitudes ubs ON e.usuario_banco_id = ubs.id 
+                                                      WHERE e.id = s.evaluacion_seleccionada) as usuario_banco_id_seleccionado,
+                                                     " . ($esUsuarioBancoLista
+                                                         ? motus_sql_decision_banco_lista($isAdminBanco, (int) $_SESSION['user_id'], (int) ($bancoIdSesion ?? 0)) . ','
+                                                         : '') . "
+                                                     " . solicitud_sql_campos_vehiculo_reserva() . "
+                                              FROM solicitudes_credito s
+                                              LEFT JOIN usuarios u ON s.gestor_id = u.id
+                                              LEFT JOIN ejecutivos_ventas ev ON s.ejecutivo_ventas_id = ev.id
+                                          ";
+                                        
+                                          // Aplicar filtro según el rol del usuario
+                                          $whereParts = [];
+                                          $whereParams = [];
+                                          if ($isAdminBanco && !$isAdmin) {
+                                              $bancoIdFiltroLista = (int) ($bancoIdSesion ?? 0);
+                                              if ($bancoIdFiltroLista > 0) {
+                                                  $whereParts[] = "EXISTS (
+                                                      SELECT 1 FROM usuarios_banco_solicitudes ubs
+                                                      INNER JOIN usuarios u_banco ON u_banco.id = ubs.usuario_banco_id
+                                                      WHERE ubs.solicitud_id = s.id
+                                                      AND ubs.estado = 'activo'
+                                                      AND u_banco.banco_id = {$bancoIdFiltroLista}
+                                                  )";
+                                              } else {
+                                                  $whereParts[] = "1=0";
+                                              }
+                                          } elseif ($isBancoAnalista && !$isAdmin) {
+                                              // Usuario banco solo ve sus solicitudes asignadas
+                                              $whereParts[] = "EXISTS (
+                                                  SELECT 1 FROM usuarios_banco_solicitudes ubs 
+                                                  WHERE ubs.solicitud_id = s.id 
+                                                  AND ubs.usuario_banco_id = " . (int) $_SESSION['user_id'] . "
+                                                  AND ubs.estado = 'activo'
+                                              )";
+                                          } elseif (in_array('ROLE_GESTOR', $userRoles) && !in_array('ROLE_ADMIN', $userRoles)) {
+                                              // Gestor solo ve sus solicitudes asignadas
+                                              $whereParts[] = "s.gestor_id = " . (int) $_SESSION['user_id'];
+                                          } elseif ($isSp && !$isAdmin) {
+                                              [$spSqlLista, $spParamsLista] = motus_sql_filtro_alcance_sp_sobre_solicitud('s', $userRoles);
+                                              $spCondLista = preg_replace('/^\s*AND\s+/i', '', trim($spSqlLista));
+                                              if ($spCondLista !== '') {
+                                                  $whereParts[] = $spCondLista;
+                                                  $whereParams = array_merge($whereParams, $spParamsLista);
+                                              }
+                                          }
+
+                                          if ($esHistorico) {
+                                              $whereParts[] = "(s.estado IN ($estadosHistoricoSql) OR s.archivada = 1)";
+                                          } else {
+                                              $whereParts[] = "(s.estado NOT IN ($estadosHistoricoSql) AND s.archivada = 0)";
+                                          }
+
+                                          if (!empty($whereParts)) {
+                                              $sql .= " WHERE " . implode(' AND ', $whereParts);
+                                          }
+                                        
+                                        $sql .= " ORDER BY (s.estado = 'Nueva') DESC, s.id DESC";
+                                        
+                                        $stmt = $pdo->prepare($sql);
+                                        $stmt->execute($whereParams);
+                                        $solicitudes = $stmt->fetchAll();
+                                        
+                                        foreach ($solicitudes as $solicitud):
+                                            $estadoClass = '';
+                                            switch($solicitud['estado']) {
+                                                case 'Nueva': $estadoClass = 'estado-nueva'; break;
+                                                case 'En Revisión Banco':
+                                                case 'Reevaluación por los Bancos':
+                                                case 'Evaluacion':
+                                                case 'Comité':
+                                                case 'Reconsideración':
+                                                case 'Pend. Firma':
+                                                case 'Pend. Poliza':
+                                                case 'Pend. Abono':
+                                                case 'Pend. Abono y poliza':
+                                                case 'Pend. CPP':
+                                                    $estadoClass = 'estado-revision'; break;
+                                                case 'Pre Aprobado':
+                                                case 'Aprobado con Condición':
+                                                case 'Aprobada': $estadoClass = 'estado-aprobada'; break;
+                                                case 'Rechazada': $estadoClass = 'estado-rechazada'; break;
+                                                case 'Completada': $estadoClass = 'estado-completada'; break;
+                                                case 'Desistimiento': $estadoClass = 'estado-desistimiento'; break;
+                                                default: $estadoClass = 'estado-revision'; break;
+                                            }
+                                            
+                                            $respuestaClass = '';
+                                            switch($solicitud['respuesta_banco']) {
+                                                case 'Pendiente': $respuestaClass = 'estado-revision'; break;
+                                                case 'Aprobado': $respuestaClass = 'estado-aprobada'; break;
+                                                case 'Pre Aprobado': $respuestaClass = 'estado-revision'; break;
+                                                case 'Rechazado': $respuestaClass = 'estado-rechazada'; break;
+                                            }
+                                            $alertaSinRespuesta2h = !empty($solicitud['alerta_sin_respuesta_2h']);
+                                            $filaClases = [];
+                                            if ($alertaSinRespuesta2h) {
+                                                $filaClases[] = 'solicitud-sin-respuesta-2h';
+                                            }
+                                            if (($solicitud['estado'] ?? '') === 'Aprobada') {
+                                                $filaClases[] = 'solicitud-estado-aprobada';
+                                            }
+                                            $filaClase = implode(' ', $filaClases);
+                                            $filaTitulo = $alertaSinRespuesta2h
+                                                ? 'Enviada a bancos hace más de 2 horas sin ninguna respuesta'
+                                                : '';
+                                        ?>
+                                        <tr class="<?php echo $filaClase; ?>"<?php echo $filaTitulo !== '' ? ' title="' . htmlspecialchars($filaTitulo, ENT_QUOTES, 'UTF-8') . '"' : ''; ?>>
+                                            <td data-order="<?php echo (int) $solicitud['id']; ?>">
+                                                <?php if ($isAdmin): ?>
+                                                <a href="javascript:void(0);" class="link-cronologia-solicitud text-primary fw-semibold text-decoration-underline" role="button"
+                                                   data-id="<?php echo (int) $solicitud['id']; ?>"
+                                                   data-nombre="<?php echo htmlspecialchars($solicitud['nombre_cliente'] ?? '', ENT_QUOTES, 'UTF-8'); ?>"
+                                                   title="Ver cronología de la solicitud"><?php echo (int) $solicitud['id']; ?></a>
+                                                <?php else: ?>
+                                                <?php echo (int) $solicitud['id']; ?>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td><?php echo htmlspecialchars($solicitud['nombre_cliente']); ?></td>
+                                            <?php if ($esUsuarioBancoLista): ?>
+                                            <td><?php echo htmlspecialchars($solicitud['cedula']); ?></td>
+                                            <td>
+                                                <?php
+                                                $estadoBancoVista = motus_estado_vista_banco($solicitud['decision_banco_vista'] ?? null);
+                                                ?>
+                                                <span class="badge badge-estado <?php echo htmlspecialchars($estadoBancoVista['class']); ?>">
+                                                    <?php echo htmlspecialchars($estadoBancoVista['label']); ?>
+                                                </span>
+                                            </td>
+                                            <td>
+                                                <button type="button" class="btn btn-sm btn-primary" onclick="verRespuestasBanco(<?php echo (int) $solicitud['id']; ?>)" title="Ver mis evaluaciones en esta solicitud">
+                                                    <i class="fas fa-clipboard-list me-1"></i>Ver mis respuestas
+                                                </button>
+                                            </td>
+                                            <?php endif; ?>
+                                            <td><?php echo htmlspecialchars(solicitud_texto_vehiculo_lista($solicitud)); ?></td>
+                                            <td>
+                                                <?php if ($isAdmin): ?>
+                                                    <?php 
+                                                    $gestorNombre = htmlspecialchars($solicitud['gestor_nombre'] . ' ' . $solicitud['gestor_apellido'], ENT_QUOTES, 'UTF-8');
+                                                    $gestorId = $solicitud['gestor_id'] ?? null;
+                                                    ?>
+                                                    <a href="javascript:void(0);" 
+                                                       class="text-primary text-decoration-underline cambiar-gestor-link" 
+                                                       data-solicitud-id="<?php echo $solicitud['id']; ?>"
+                                                       data-gestor-nombre="<?php echo htmlspecialchars($gestorNombre, ENT_QUOTES, 'UTF-8'); ?>"
+                                                       data-gestor-id="<?php echo $gestorId ? $gestorId : ''; ?>"
+                                                       title="Click para cambiar gestor">
+                                                        <?php echo $gestorNombre ?: 'Sin asignar'; ?>
+                                                    </a>
+                                                <?php else: ?>
+                                                    <?php echo htmlspecialchars($solicitud['gestor_nombre'] . ' ' . $solicitud['gestor_apellido']); ?>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <?php
+                                                $vendedorNombre = trim((string)($solicitud['vendedor_nombre'] ?? ''));
+                                                echo htmlspecialchars($vendedorNombre !== '' ? $vendedorNombre : 'Sin vendedor');
+                                                ?>
+                                            </td>
+                                            <?php if (!$esUsuarioBancoLista): ?>
+                                            <td>
+                                                <?php 
+                                                $totalBancos = $solicitud['total_usuarios_banco'] ?? 0;
+                                                if ($totalBancos > 0): ?>
+                                                    <button class="btn btn-sm btn-info" onclick="verUsuariosBanco(<?php echo $solicitud['id']; ?>)" title="Ver Usuarios Banco Asignados">
+                                                        <i class="fas fa-users me-1"></i><?php echo $totalBancos; ?> Usuario<?php echo $totalBancos > 1 ? 's' : ''; ?>
+                                                    </button>
+                                                <?php else: ?>
+                                                    <span class="text-muted">Sin asignar</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <button class="btn btn-sm btn-primary" onclick="verRespuestasBancoAdmin(<?php echo $solicitud['id']; ?>)" title="Ver Respuestas del Banco">
+                                                    <i class="fas fa-clipboard-list me-1"></i>Ver Respuestas
+                                                </button>
+                                            </td>
+                                            <?php endif; ?>
+                                              <?php if (!$esUsuarioBancoLista): ?>
+                                              <td><span class="badge badge-estado <?php echo $estadoClass; ?>"><?php echo htmlspecialchars($solicitud['estado'] ?? 'N/A'); ?></span><?php if (!empty($solicitud['archivada'])): ?><br><span class="badge bg-secondary mt-1" title="Archivada en histórico sin cambiar su estado">Archivada</span><?php endif; ?></td>
+                                              <?php endif; ?>
+                                              <td><?php echo date('d/m/Y H:i', strtotime($solicitud['fecha_creacion'])); ?></td>
+                                              <td>
+                                                  <?php
+                                                  // Analista banco: si hay propuesta seleccionada de otro, ocultar acciones.
+                                                  // Admin banco (solo vista) siempre puede abrir detalles.
+                                                  $mostrarBotonesAcciones = true;
+                                                  if ($isBancoAnalista && !$isAdmin) {
+                                                      $evaluacionSeleccionada = $solicitud['evaluacion_seleccionada'] ?? null;
+                                                      if ($evaluacionSeleccionada) {
+                                                          // Obtener el usuario_banco_id del usuario actual para esta solicitud
+                                                          $stmtUsuarioBanco = $pdo->prepare("
+                                                              SELECT usuario_banco_id 
+                                                              FROM usuarios_banco_solicitudes 
+                                                              WHERE solicitud_id = ? AND usuario_banco_id = ? AND estado = 'activo'
+                                                              LIMIT 1
+                                                          ");
+                                                          $stmtUsuarioBanco->execute([$solicitud['id'], $_SESSION['user_id']]);
+                                                          $asignacionUsuario = $stmtUsuarioBanco->fetch();
+                                                          
+                                                          $usuarioBancoIdActual = $asignacionUsuario['usuario_banco_id'] ?? null;
+                                                          $usuarioBancoIdSeleccionado = $solicitud['usuario_banco_id_seleccionado'] ?? null;
+                                                          
+                                                          // Solo mostrar botones si el usuario actual es el dueño de la evaluación seleccionada
+                                                          if ($usuarioBancoIdActual != $usuarioBancoIdSeleccionado) {
+                                                              $mostrarBotonesAcciones = false;
+                                                          }
+                                                      }
+                                                  }
+                                                  ?>
+                                                  <?php if ($mostrarBotonesAcciones): ?>
+                                                  <div class="btn-group-vertical btn-group-sm" role="group">
+                                                      <div class="btn-group btn-group-sm mb-1" role="group">
+                                                          <button class="btn btn-info btn-action" onclick="verDetalles(<?php echo $solicitud['id']; ?>)" title="Ver Detalles">
+                                                              <i class="fas fa-eye"></i>
+                                                          </button>
+                                                          <button class="btn btn-primary btn-action" onclick="editarSolicitud(<?php echo $solicitud['id']; ?>)" title="Editar">
+                                                              <i class="fas fa-edit"></i>
+                                                          </button>
+                                                      </div>
+                                                      <div class="btn-group btn-group-sm mb-1" role="group">
+                                                          <button class="btn btn-success btn-action" onclick="verMuro(<?php echo $solicitud['id']; ?>)" title="Muro de comunicación">
+                                                              <i class="fas fa-comments"></i>
+                                                          </button>
+                                                          <button class="btn btn-warning btn-action" onclick="abrirModalAdjuntosDesdeTabla(<?php echo $solicitud['id']; ?>)" title="Gestionar Adjuntos">
+                                                              <i class="fas fa-paperclip"></i>
+                                                          </button>
+                                                      </div>
+                                                      <?php 
+                                                      // Martillo visible salvo estados finales; la selección de propuesta sigue bloqueando a otros bancos.
+                                                      $estadosSinDecisionBanco = ['Rechazada', 'Completada', 'Desistimiento'];
+                                                      $puedeResponderBanco = in_array('ROLE_BANCO', $userRoles, true) &&
+                                                          !in_array((string) ($solicitud['estado'] ?? ''), $estadosSinDecisionBanco, true);
+                                                      if ($puedeResponderBanco): ?>
+                                                      <div class="btn-group btn-group-sm" role="group">
+                                                          <button class="btn btn-success btn-action" onclick="abrirModalAprobacion(<?php echo $solicitud['id']; ?>)" title="Aprobar/Rechazar Solicitud">
+                                                              <i class="fas fa-gavel"></i>
+                                                          </button>
+                                                      </div>
+                                                      <?php endif; ?>
+                                                    <?php if (in_array('ROLE_ADMIN', $userRoles) || in_array('ROLE_GESTOR', $userRoles)): ?>
+                                                    <div class="btn-group btn-group-sm mb-1" role="group">
+                                                        <button class="btn btn-warning btn-action" onclick="abrirModalCambioEstado(<?php echo $solicitud['id']; ?>)" title="Cambiar Estado">
+                                                            <i class="fas fa-cogs"></i>
+                                                        </button>
+                                                    </div>
+                                                    <?php endif; ?>
+                                                                                                          <?php if (in_array('ROLE_ADMIN', $userRoles)): ?>
+                                                      <div class="btn-group btn-group-sm" role="group">
+                                                          <button class="btn btn-danger btn-action" onclick="eliminarSolicitud(<?php echo $solicitud['id']; ?>)" title="Eliminar Solicitud (Solo Admin)">
+                                                              <i class="fas fa-trash"></i>
+                                                          </button>
+                                                      </div>
+                                                      <?php endif; ?>
+                                                  </div>
+                                                  <?php else: ?>
+                                                  <span class="text-muted"><small>Propuesta seleccionada</small></span>
+                                                  <?php endif; ?>
+                                              </td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Solicitud -->
+    <div class="modal fade" id="solicitudModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="solicitudModalLabel">
+                        <i class="fas fa-file-alt me-2"></i>Nueva Solicitud de Crédito
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form id="solicitudForm" method="POST" action="javascript:void(0);">
+                    <div class="modal-body">
+                        <input type="hidden" id="solicitud_id" name="id">
+                        <input type="hidden" id="financiamiento_registro_id" name="financiamiento_registro_id" value="">
+                        <input type="hidden" id="import_pdf_token" name="import_pdf_token" value="">
+                        <input type="hidden" id="import_pdf_nombre_original" name="import_pdf_nombre_original" value="">
+                        
+                        <!-- Cargar desde Sol Financiamiento -->
+                        <div class="mb-3 p-3 rounded" style="background: #f0f4f8;">
+                            <label for="cliente_financiamiento_select" class="form-label">
+                                <i class="fas fa-file-invoice-dollar me-1"></i>Cargar desde Sol Financiamiento
+                            </label>
+                            <select class="form-select" id="cliente_financiamiento_select" data-placeholder="Seleccionar cliente...">
+                                <option value="">Seleccionar cliente...</option>
+                            </select>
+                            <small class="text-muted">Abra el listado y escriba en el buscador para filtrar; luego seleccione un cliente que haya llenado el formulario de financiamiento para prellenar esta solicitud.</small>
+                        </div>
+                        
+                        <!-- Pestañas -->
+                        <ul class="nav nav-tabs" id="solicitudTabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="datos-generales-tab" data-bs-toggle="tab" data-bs-target="#datos-generales" type="button" role="tab">
+                                    <i class="fas fa-user me-2"></i>Datos Generales
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="perfil-financiero-tab" data-bs-toggle="tab" data-bs-target="#perfil-financiero" type="button" role="tab">
+                                    <i class="fas fa-chart-line me-2"></i>Perfil Financiero
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="datos-auto-tab" data-bs-toggle="tab" data-bs-target="#datos-auto" type="button" role="tab">
+                                    <i class="fas fa-car me-2"></i>Datos del Auto
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="analisis-tab" data-bs-toggle="tab" data-bs-target="#analisis" type="button" role="tab">
+                                    <i class="fas fa-comments me-2"></i>Análisis
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="adjuntos-tab" data-bs-toggle="tab" data-bs-target="#adjuntos" type="button" role="tab">
+                                    <i class="fas fa-paperclip me-2"></i>Adjuntos
+                                </button>
+                            </li>
+                            <?php if (!$isBanco): ?>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="usuarios-banco-tab" data-bs-toggle="tab" data-bs-target="#usuarios-banco" type="button" role="tab">
+                                    <i class="fas fa-university me-2"></i>Usuarios Banco
+                                </button>
+                            </li>
+                            <?php endif; ?>
+                            <li class="nav-item" role="presentation" id="cita-firma-tab-li" style="display: none;">
+                                <button class="nav-link" id="cita-firma-tab" data-bs-toggle="tab" data-bs-target="#cita-firma" type="button" role="tab">
+                                    <i class="fas fa-calendar-check me-2"></i>Cita y Firma
+                                </button>
+                            </li>
+                        </ul>
+                        
+                        <div class="tab-content" id="solicitudTabContent">
+                            <!-- Datos Generales -->
+                            <div class="tab-pane fade show active" id="datos-generales" role="tabpanel">
+                                <div class="row mt-3">
+                                    <div class="col-md-6">
+                                        <div class="mb-3">
+                                            <label class="form-label">Tipo de Persona *</label>
+                                            <select class="form-select" id="tipo_persona" name="tipo_persona" required>
+                                                <option value="">Seleccionar...</option>
+                                                <option value="Natural">Persona Natural</option>
+                                                <option value="Juridica">Persona Jurídica</option>
+                                            </select>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="nombre_cliente" class="form-label">Nombre del Cliente *</label>
+                                            <input type="text" class="form-control" id="nombre_cliente" name="nombre_cliente" required>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="cedula" class="form-label"># de Cédula *</label>
+                                            <input type="text" class="form-control" id="cedula" name="cedula" required>
+                                        </div>
+                                        <div class="row">
+                                            <div class="col-md-6">
+                                                <div class="mb-3">
+                                                    <label for="edad" class="form-label">Edad</label>
+                                                    <input type="number" class="form-control" id="edad" name="edad">
+                                                </div>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <div class="mb-3">
+                                                    <label for="genero" class="form-label">Género</label>
+                                                    <select class="form-select" id="genero" name="genero">
+                                                        <option value="">Seleccionar...</option>
+                                                        <option value="Masculino">Masculino</option>
+                                                        <option value="Femenino">Femenino</option>
+                                                        <option value="Otro">Otro</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <div class="mb-3">
+                                            <label for="telefono" class="form-label">Teléfono</label>
+                                            <input type="text" class="form-control" id="telefono" name="telefono">
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="email" class="form-label">E-mail</label>
+                                            <input type="email" class="form-control" id="email" name="email">
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="email_pipedrive" class="form-label">Email PipeDrive</label>
+                                            <input type="email" class="form-control" id="email_pipedrive" name="email_pipedrive">
+                                        </div>
+                                        <div class="mb-3 position-relative">
+                                            <label for="buscar_ejecutivo" class="form-label">Ejecutivo de Ventas</label>
+                                            <input type="text"
+                                                   class="form-control"
+                                                   id="buscar_ejecutivo"
+                                                   placeholder="Buscar por nombre, sucursal o correo..."
+                                                   autocomplete="off">
+                                            <select class="form-select d-none"
+                                                    id="ejecutivo_ventas_id"
+                                                    name="ejecutivo_ventas_id"
+                                                    aria-hidden="true"
+                                                    tabindex="-1">
+                                                <option value="">Sin ejecutivo asignado</option>
+                                                <?php foreach ($ejecutivosVentas as $ej): ?>
+                                                    <?php
+                                                        $nombreEj = trim((string)($ej['nombre'] ?? ''));
+                                                        $sucursalEj = trim((string)($ej['sucursal'] ?? ''));
+                                                        $emailEj = trim((string)($ej['email'] ?? ''));
+                                                        $label = $nombreEj;
+                                                        if ($sucursalEj !== '') {
+                                                            $label .= ' (' . $sucursalEj . ')';
+                                                        }
+                                                        if ($emailEj !== '') {
+                                                            $label .= ' - ' . $emailEj;
+                                                        }
+                                                        $search = mb_strtolower($label, 'UTF-8');
+                                                    ?>
+                                                    <option value="<?php echo (int) $ej['id']; ?>"
+                                                            data-search="<?php echo htmlspecialchars($search, ENT_QUOTES, 'UTF-8'); ?>"
+                                                            <?php if ($emailEj !== ''): ?>data-email="<?php echo htmlspecialchars($emailEj, ENT_QUOTES, 'UTF-8'); ?>"<?php endif; ?>>
+                                                        <?php echo htmlspecialchars($label, ENT_QUOTES, 'UTF-8'); ?>
+                                                    </option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                            <div id="ejecutivo_lista" class="list-group position-absolute shadow-sm w-100" style="top: 100%; left: 0; max-height: 220px; overflow-y: auto; display: none; z-index: 1050;"></div>
+                                            <small class="text-muted">Opcional. Escriba para buscar y haga clic en un resultado.</small>
+                                        </div>
+                                        <div class="row">
+                                            <div class="col-md-6">
+                                                <div class="form-check">
+                                                    <input class="form-check-input" type="checkbox" id="casado" name="casado" value="1">
+                                                    <label class="form-check-label" for="casado">Casado</label>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <div class="mb-3">
+                                                    <label for="hijos" class="form-label">Hijos</label>
+                                                    <input type="number" class="form-control" id="hijos" name="hijos" value="0">
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Dirección -->
+                                <h6 class="mt-4 mb-3">Dirección</h6>
+                                <div class="row">
+                                    <div class="col-md-3">
+                                        <div class="mb-3">
+                                            <label for="provincia" class="form-label">Provincia</label>
+                                            <input type="text" class="form-control" id="provincia" name="provincia">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="mb-3">
+                                            <label for="distrito" class="form-label">Distrito</label>
+                                            <input type="text" class="form-control" id="distrito" name="distrito">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="mb-3">
+                                            <label for="corregimiento" class="form-label">Corregimiento</label>
+                                            <input type="text" class="form-control" id="corregimiento" name="corregimiento">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <div class="mb-3">
+                                            <label for="barriada" class="form-label">Barriada</label>
+                                            <input type="text" class="form-control" id="barriada" name="barriada">
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <div class="mb-3">
+                                            <label for="casa_edif" class="form-label">Casa / Edif</label>
+                                            <input type="text" class="form-control" id="casa_edif" name="casa_edif">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <div class="mb-3">
+                                            <label for="numero_casa_apto" class="form-label"># de casa / Apto</label>
+                                            <input type="text" class="form-control" id="numero_casa_apto" name="numero_casa_apto">
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="direccion" class="form-label">Dirección Completa</label>
+                                    <textarea class="form-control" id="direccion" name="direccion" rows="2"></textarea>
+                                </div>
+                            </div>
+                            
+                            <!-- Perfil Financiero -->
+                            <div class="tab-pane fade" id="perfil-financiero" role="tabpanel">
+                                <div class="row mt-3">
+                                    <div class="col-md-6">
+                                        <div class="mb-3">
+                                            <label for="perfil_financiero" class="form-label">Perfil Financiero *</label>
+                                            <select class="form-select" id="perfil_financiero" name="perfil_financiero" required>
+                                                <option value="">Seleccionar...</option>
+                                                <option value="Asalariado">Asalariado</option>
+                                                <option value="Jubilado">Jubilado</option>
+                                                <option value="Independiente">Independiente</option>
+                                            </select>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="ingreso" class="form-label">Ingreso $</label>
+                                            <input type="number" class="form-control" id="ingreso" name="ingreso" step="0.01">
+                                        </div>
+                                                                                  <div class="mb-3">
+                                              <label for="tiempo_laborar" class="form-label">Tiempo de Laborar / Actividad Comercial</label>
+                                              <input type="text" class="form-control" id="tiempo_laborar" name="tiempo_laborar">
+                                          </div>
+                                          <div class="mb-3">
+                                              <label for="profesion" class="form-label">Profesión</label>
+                                              <input type="text" class="form-control" id="profesion" name="profesion">
+                                          </div>
+                                          <div class="mb-3">
+                                              <label for="ocupacion" class="form-label">Ocupación</label>
+                                              <input type="text" class="form-control" id="ocupacion" name="ocupacion">
+                                          </div>
+                                      </div>
+                                      <div class="col-md-6">
+                                          <div class="mb-3">
+                                              <label for="nombre_empresa_negocio" class="form-label">Nombre de la Empresa / Negocio</label>
+                                              <input type="text" class="form-control" id="nombre_empresa_negocio" name="nombre_empresa_negocio">
+                                          </div>
+                                          <div class="mb-3">
+                                              <label for="estabilidad_laboral" class="form-label">Estabilidad Laboral</label>
+                                              <input type="date" class="form-control" id="estabilidad_laboral" name="estabilidad_laboral">
+                                          </div>
+                                          <div class="mb-3">
+                                              <label for="fecha_constitucion" class="form-label">Fecha de Constitución</label>
+                                              <input type="date" class="form-control" id="fecha_constitucion" name="fecha_constitucion">
+                                          </div>
+                                          <div class="mb-3">
+                                              <label for="continuidad_laboral" class="form-label">Continuidad Laboral</label>
+                                              <input type="text" class="form-control" id="continuidad_laboral" name="continuidad_laboral">
+                                          </div>
+                                      </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Datos del Auto -->
+                            <div class="tab-pane fade" id="datos-auto" role="tabpanel">
+                                <div class="mt-3">
+                                    <!-- Botón para agregar vehículo (solo para admin y gestor) -->
+                                    <?php if ($isAdmin || $isGestor): ?>
+                                    <div class="mb-3">
+                                        <button type="button" class="btn btn-success" onclick="agregarVehiculo()">
+                                            <i class="fas fa-plus me-2"></i>Agregar Vehículo
+                                        </button>
+                                    </div>
+                                    <?php endif; ?>
+                                    
+                                    <!-- Lista de vehículos -->
+                                    <div id="listaVehiculos"></div>
+                                </div>
+                            </div>
+                            
+                            <!-- Análisis -->
+                            <div class="tab-pane fade" id="analisis" role="tabpanel">
+                                <div class="mt-3">
+                                    <div class="mb-3">
+                                        <label for="score_apc" class="form-label">Score APC</label>
+                                        <input type="number" class="form-control" id="score_apc" name="score_apc" step="0.01" min="0" placeholder="Ej. 750">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label for="comentarios_gestor" class="form-label">Comentarios del Gestor</label>
+                                        <textarea class="form-control" id="comentarios_gestor" name="comentarios_gestor" rows="4" maxlength="1000" placeholder="Escriba un breve análisis del perfil del cliente (máximo 1000 caracteres)"></textarea>
+                                        <div class="form-text">Caracteres restantes: <span id="contador_comentarios">1000</span></div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Adjuntos -->
+                            <div class="tab-pane fade" id="adjuntos" role="tabpanel">
+                                <div class="mt-3 text-center">
+                                    <div class="card">
+                                        <div class="card-body">
+                                            <i class="fas fa-paperclip fa-3x text-muted mb-3"></i>
+                                            <h5 class="card-title">Gestión de Adjuntos</h5>
+                                            <p class="card-text text-muted">
+                                                Gestiona los archivos adjuntos de esta solicitud de forma independiente.
+                                            </p>
+                                            <button type="button" class="btn btn-primary" onclick="abrirModalAdjuntos()">
+                                                <i class="fas fa-folder-open me-2"></i>Abrir Gestor de Adjuntos
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Usuarios Banco -->
+                            <?php if (!$isBanco): ?>
+                            <div class="tab-pane fade" id="usuarios-banco" role="tabpanel">
+                                <div class="mt-3">
+                                    <!-- Agregar Usuario Banco -->
+                                    <div class="card">
+                                        <div class="card-header">
+                                            <h6 class="mb-0">
+                                                <i class="fas fa-user-plus me-2"></i>Asignar Usuario Banco
+                                            </h6>
+                                        </div>
+                                        <div class="card-body">
+                                            <div class="row">
+                                                <div class="col-md-8">
+                                                    <label for="buscar_usuario_banco" class="form-label">Buscar Usuario Banco</label>
+                                                    <input type="text" class="form-control" id="buscar_usuario_banco" placeholder="Escriba el nombre del banco o usuario...">
+                                                    <div id="sugerencias_usuarios" class="list-group mt-2" style="display: none;"></div>
+                                                </div>
+                                                <div class="col-md-4 d-flex align-items-end">
+                                                    <button type="button" class="btn btn-success btn-sm" id="agregar_usuario_banco" disabled>
+                                                        <i class="fas fa-plus me-1"></i>Agregar Usuario
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- Tabla de Usuarios Asignados -->
+                                    <div class="mt-4">
+                                        <div class="card">
+                                            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                                                <h6 class="mb-0">
+                                                    <i class="fas fa-users me-2"></i>Usuarios Banco Asignados
+                                                </h6>
+                                                <div class="d-flex flex-wrap gap-2">
+                                                    <button type="button" class="btn btn-primary btn-sm" id="btnEnviarResumenTodos" disabled
+                                                            title="Enviar resumen por correo a todos los usuarios asignados">
+                                                        <i class="fas fa-envelope me-1"></i>Enviar resumen a todos
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="card-body">
+                                                <div class="table-responsive">
+                                                    <table class="table table-sm" id="usuariosAsignadosTable">
+                                                        <thead>
+                                                            <tr>
+                                                                <th>Usuario</th>
+                                                                <th>Banco</th>
+                                                                <th>Estado</th>
+                                                                <th>Fecha Asignación</th>
+                                                                <th>Correos enviados</th>
+                                                                <th>Último Mensaje</th>
+                                                                <th>Acciones</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody id="usuariosAsignadosBody">
+                                                            <!-- Se llenará dinámicamente -->
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <?php endif; ?>
+                            
+                            <!-- Cita y Firma -->
+                            <div class="tab-pane fade" id="cita-firma" role="tabpanel">
+                                <div class="mt-3">
+                                    <div class="d-flex justify-content-start mb-3">
+                                        <button type="button" class="btn btn-primary" id="btnAgregarEventoCitaFirma" onclick="abrirModalEventoCitaFirma()">
+                                            <i class="fas fa-plus me-2"></i>Agregar Evento
+                                        </button>
+                                    </div>
+                                    <div class="table-responsive">
+                                        <table class="table table-striped table-hover align-middle" id="eventosCitaFirmaTable">
+                                            <thead>
+                                                <tr>
+                                                    <th>Nombre del evento</th>
+                                                    <th>Fecha</th>
+                                                    <th>Comentario</th>
+                                                    <th style="width:120px;">Acciones</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="eventosCitaFirmaTableBody">
+                                                <tr>
+                                                    <td colspan="4" class="text-center text-muted">No hay eventos registrados</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                        <button type="button" class="btn btn-info" id="btnCerrarDespuesAdjuntos" style="display: none;" data-bs-dismiss="modal">
+                            <i class="fas fa-check me-2"></i>Finalizar
+                        </button>
+                                                  <?php if (!$isBanco): ?>
+                          <button type="submit" class="btn btn-success" id="btnGuardarSolicitud" onclick="event.preventDefault(); event.stopPropagation(); guardarSolicitud(); return false;">
+                              <i class="fas fa-save me-2"></i>Guardar Solicitud
+                          </button>
+                          <?php endif; ?>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Cargar por PDF -->
+    <div class="modal fade" id="importPdfModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);">
+                    <h5 class="modal-title text-white">
+                        <i class="fas fa-file-pdf me-2"></i>Cargar solicitud desde PDF
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form id="importPdfForm" method="POST" action="javascript:void(0);" enctype="multipart/form-data">
+                    <div class="modal-body">
+                        <div class="alert alert-info mb-3">
+                            Sube el PDF recibido por correo. El sistema extrae la información y abre <strong>Nueva Solicitud</strong> prellenada.
+                        </div>
+                        <div class="mb-3">
+                            <label for="import_pdf_archivo" class="form-label">Archivo PDF *</label>
+                            <input type="file" class="form-control" id="import_pdf_archivo" name="archivo_pdf" accept="application/pdf,.pdf" required>
+                            <small class="text-muted">Solo PDF, máximo 10MB.</small>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6">
+                                <label for="import_tipo_persona" class="form-label">Tipo de Persona *</label>
+                                <select class="form-select" id="import_tipo_persona" name="tipo_persona" required>
+                                    <option value="">Seleccionar...</option>
+                                    <option value="Natural">Persona Natural</option>
+                                    <option value="Juridica">Persona Jurídica</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label for="import_perfil_financiero" class="form-label">Perfil Financiero *</label>
+                                <select class="form-select" id="import_perfil_financiero" name="perfil_financiero" required>
+                                    <option value="">Seleccionar...</option>
+                                    <option value="Asalariado">Asalariado</option>
+                                    <option value="Jubilado">Jubilado</option>
+                                    <option value="Independiente">Independiente</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                        <button type="submit" class="btn btn-primary" id="btnImportarPdf">
+                            <i class="fas fa-upload me-2"></i>Cargar y prellenar
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Información -->
+    <div class="modal fade" id="infoModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #17a2b8 0%, #138496 100%);">
+                    <h5 class="modal-title">
+                        <i class="fas fa-info-circle me-2"></i>Información de Campos Requeridos
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6 class="text-danger mb-3">
+                                <i class="fas fa-exclamation-circle me-2"></i>Campos Obligatorios
+                            </h6>
+                            <ul class="list-group list-group-flush">
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-check-circle text-danger me-2"></i>
+                                    <strong>Tipo de Persona</strong>
+                                    <small class="text-muted ms-2">(Natural o Jurídica)</small>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-check-circle text-danger me-2"></i>
+                                    <strong>Nombre del Cliente</strong>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-check-circle text-danger me-2"></i>
+                                    <strong># de Cédula</strong>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-check-circle text-danger me-2"></i>
+                                    <strong>Perfil Financiero</strong>
+                                    <small class="text-muted ms-2">(Asalariado, Jubilado o Independiente)</small>
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="col-md-6">
+                            <h6 class="text-info mb-3">
+                                <i class="fas fa-lightbulb me-2"></i>Campos Recomendados
+                            </h6>
+                            <ul class="list-group list-group-flush">
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-phone text-info me-2"></i>
+                                    <strong>Teléfono</strong>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-envelope text-info me-2"></i>
+                                    <strong>Email</strong>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-dollar-sign text-info me-2"></i>
+                                    <strong>Ingreso Mensual</strong>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-car text-info me-2"></i>
+                                    <strong>Datos del Vehículo</strong>
+                                    <small class="text-muted ms-2">(Marca, Modelo, Año)</small>
+                                </li>
+                                <li class="list-group-item d-flex align-items-center">
+                                    <i class="fas fa-comments text-info me-2"></i>
+                                    <strong>Comentarios del Gestor</strong>
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                    
+                    <div class="alert alert-warning mt-4">
+                        <h6 class="alert-heading">
+                            <i class="fas fa-exclamation-triangle me-2"></i>Importante
+                        </h6>
+                        <p class="mb-0">
+                            Aunque solo 4 campos son obligatorios, se recomienda completar la mayor cantidad de información posible 
+                            para que el banco pueda realizar un análisis más preciso de la solicitud de crédito.
+                        </p>
+                    </div>
+                    
+                    <div class="alert alert-success">
+                        <h6 class="alert-heading">
+                            <i class="fas fa-tips me-2"></i>Consejos
+                        </h6>
+                        <ul class="mb-0">
+                            <li>Los campos obligatorios están marcados con <span class="text-danger">*</span></li>
+                            <li>Puedes navegar entre las pestañas para organizar la información</li>
+                            <li>El sistema guardará automáticamente una nota cuando crees la solicitud</li>
+                            <li>El banco podrá ver y comentar en el muro de tiempo</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                    <button type="button" class="btn btn-success" data-bs-dismiss="modal" data-bs-toggle="modal" data-bs-target="#solicitudModal" onclick="limpiarFormularioSolicitud()">
+                        <i class="fas fa-plus me-2"></i>Crear Solicitud
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Autos disponibles (Automarket_Invs_web) - DataTable -->
+    <div class="modal fade" id="autosDisponiblesModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                    <h5 class="modal-title text-white">
+                        <i class="fas fa-car me-2"></i>Autos disponibles
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="autosDisponiblesError" class="alert alert-danger d-none mb-2" role="alert"></div>
+                    <table id="tablaAutosDisponibles" class="table table-striped table-hover w-100" style="width:100%">
+                        <thead>
+                            <tr>
+                                <th>Imagen</th>
+                                <th>Marca</th>
+                                <th>Modelo</th>
+                                <th>Año</th>
+                                <th>Precio</th>
+                                <th>Transmisión</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal imagen vehículo ampliada + link Impel -->
+    <div class="modal fade" id="imagenVehiculoModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header py-2">
+                    <h6 class="modal-title">Imagen del vehículo</h6>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center">
+                    <img id="imagenVehiculoGrande" src="" alt="Vehículo" class="img-fluid rounded" style="max-height:70vh; width:auto;">
+                    <div class="mt-3">
+                        <a id="imagenVehiculoLinkImpel" href="#" target="_blank" rel="noopener" class="btn btn-sm btn-primary">
+                            <i class="fas fa-external-link-alt me-1"></i> Ver en Impel
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Detalles -->
+    <div class="modal fade" id="detallesModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%);">
+                    <h5 class="modal-title text-white">
+                        <i class="fas fa-eye me-2"></i>Detalles de la Solicitud
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="detallesContent">
+                    <!-- Contenido se carga via JS -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal del Muro de comunicación -->
+    <div class="modal fade" id="muroModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #6c5ce7 0%, #a29bfe 100%);">
+                    <h5 class="modal-title">
+                        <i class="fas fa-comments me-2"></i>Muro de comunicación
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Información de la Solicitud -->
+                    <div class="row mb-4" id="muroSolicitudInfo">
+                        <!-- Se carga via AJAX -->
+                    </div>
+                    
+                    <!-- Pestañas de Vehículos -->
+                    <ul class="nav nav-tabs" id="vehiculosTabs" role="tablist">
+                        <!-- Se generan dinámicamente -->
+                    </ul>
+                    
+                    <!-- Contenido de las pestañas -->
+                    <div class="tab-content" id="vehiculosTabContent">
+                        <!-- Se generan dinámicamente -->
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Adjuntos -->
+    <div class="modal fade" id="adjuntosModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                    <h5 class="modal-title">
+                        <i class="fas fa-paperclip me-2"></i>Gestión de Adjuntos
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Información de la Solicitud -->
+                    <div class="row mb-4" id="adjuntosSolicitudInfo">
+                        <!-- Se carga via JavaScript -->
+                    </div>
+                    
+                    <!-- Tabs: Subir Adjunto | Corredor -->
+                    <ul class="nav nav-tabs mb-3" id="adjuntosTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" id="tab-subir-adjunto" data-bs-toggle="tab" data-bs-target="#pane-subir-adjunto" type="button" role="tab">
+                                <i class="fas fa-upload me-2"></i>Subir Adjunto
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-resumen-adjunto" data-bs-toggle="tab" data-bs-target="#pane-resumen-adjunto" type="button" role="tab">
+                                <i class="fas fa-file-pdf me-2"></i>Resumen
+                            </button>
+                        </li>
+                        <?php if ($isAdmin || $isGestor): ?>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-corredor" data-bs-toggle="tab" data-bs-target="#pane-corredor" type="button" role="tab">
+                                <i class="fas fa-user-tie me-2"></i>Corredor
+                            </button>
+                        </li>
+                        <?php endif; ?>
+                    </ul>
+
+                    <div class="tab-content" id="adjuntosTabsContent">
+                        <div class="tab-pane fade show active" id="pane-subir-adjunto" role="tabpanel">
+                            <!-- Formulario para subir adjuntos -->
+                            <div class="card mb-4">
+                                <div class="card-header">
+                                    <h6 class="mb-0">
+                                        <i class="fas fa-upload me-2"></i>Subir Adjunto
+                                    </h6>
+                                </div>
+                                <div class="card-body">
+                                    <form id="adjuntoForm" enctype="multipart/form-data" onsubmit="return false;">
+                                        <input type="hidden" id="adjunto_solicitud_id" name="solicitud_id">
+                                        
+                                        <div class="row">
+                                            <div class="col-md-12">
+                                                <div class="mb-3">
+                                                    <label for="archivo_adjunto" class="form-label">Seleccionar Archivos *</label>
+                                                    <input type="file" class="form-control" id="archivo_adjunto" name="archivo[]" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.gif,.txt" required>
+                                                    <div class="form-text">
+                                                        Tipos permitidos: PDF, DOC, DOCX, XLS, XLSX, JPG, PNG, GIF, TXT (Máximo 10MB por archivo)
+                                                        <br><strong>Puedes seleccionar múltiples archivos a la vez</strong>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="row">
+                                            <div class="col-md-12">
+                                                <div class="mb-3">
+                                                    <label for="descripcion_adjunto" class="form-label">Descripción (aplicará a todos los archivos)</label>
+                                                    <input type="text" class="form-control" id="descripcion_adjunto" name="descripcion" placeholder="Breve descripción de los archivos">
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="d-flex justify-content-end">
+                                            <button type="button" class="btn btn-primary" onclick="subirAdjunto()">
+                                                <i class="fas fa-upload me-2"></i>Subir Archivos
+                                            </button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                            
+                            <!-- Lista de adjuntos -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h6 class="mb-0">
+                                        <i class="fas fa-paperclip me-2"></i>Archivos Adjuntos
+                                    </h6>
+                                </div>
+                                <div class="card-body">
+                                    <div id="adjuntosContainer">
+                                        <div class="text-center text-muted">
+                                            <i class="fas fa-spinner fa-spin me-2"></i>Cargando adjuntos...
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="tab-pane fade" id="pane-resumen-adjunto" role="tabpanel">
+                            <div class="card">
+                                <div class="card-body text-center py-5">
+                                    <i class="fas fa-file-alt fa-3x text-primary mb-3"></i>
+                                    <h5 class="mb-2">Resumen de la solicitud</h5>
+                                    <p class="text-muted mb-4">
+                                        Genera en PDF el mismo resumen que se envía al banco por correo
+                                        (datos generales, perfil financiero, análisis, vehículo, evaluaciones y listado de adjuntos).
+                                    </p>
+                                    <button type="button" class="btn btn-primary btn-lg" id="btnGenerarResumenPdf" onclick="generarResumenSolicitudPdf()">
+                                        <i class="fas fa-file-pdf me-2"></i>Generar Resumen
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <?php if ($isAdmin || $isGestor): ?>
+                        <div class="tab-pane fade" id="pane-corredor" role="tabpanel">
+                            <div class="card mb-4">
+                                <div class="card-header bg-warning-subtle">
+                                    <h6 class="mb-0">
+                                        <i class="fas fa-envelope me-2"></i>Enviar resumen al Corredor
+                                    </h6>
+                                </div>
+                                <div class="card-body">
+                                    <p class="text-muted small">Envía el resumen de la solicitud (igual que a bancos) <strong>sin</strong> los adjuntos de la solicitud. Solo se adjunta el archivo de este formulario.</p>
+                                    <form id="corredorForm" enctype="multipart/form-data" onsubmit="return false;">
+                                        <input type="hidden" id="corredor_solicitud_id" name="solicitud_id">
+                                        <div class="mb-3">
+                                            <label for="corredor_archivo" class="form-label">Adjunto *</label>
+                                            <input type="file" class="form-control" id="corredor_archivo" name="archivo" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.gif,.txt" required>
+                                            <div class="form-text">Obligatorio. Máximo 10MB.</div>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="corredor_comentario_interno" class="form-label">Comentario / Descripción (Interno)</label>
+                                            <textarea class="form-control" id="corredor_comentario_interno" name="comentario_interno" rows="2" placeholder="Solo para registro interno en Motus"></textarea>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="corredor_comentario_correo" class="form-label">Comentario / Descripción (Correo)</label>
+                                            <textarea class="form-control" id="corredor_comentario_correo" name="comentario_correo" rows="2" placeholder="Si lo deja vacío, no se incluye comentario en el correo"></textarea>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="corredor_email" class="form-label">Email del corredor *</label>
+                                            <input type="email" class="form-control" id="corredor_email" name="email_corredor" required placeholder="correo@ejemplo.com">
+                                        </div>
+                                        <div class="d-flex justify-content-end">
+                                            <button type="button" class="btn btn-warning" id="btnEnviarCorredor" onclick="enviarResumenCorredor()">
+                                                <i class="fas fa-paper-plane me-2"></i>Enviar al corredor
+                                            </button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                            <div class="card">
+                                <div class="card-header">
+                                    <h6 class="mb-0">
+                                        <i class="fas fa-history me-2"></i>Archivos enviados anteriormente
+                                    </h6>
+                                </div>
+                                <div class="card-body">
+                                    <div id="corredorEnviosContainer">
+                                        <div class="text-muted small">Abra esta pestaña para ver el historial.</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: enviar adjunto a usuario banco -->
+    <div class="modal fade" id="enviarAdjuntoBancoModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #0d6efd 0%, #6610f2 100%);">
+                    <h5 class="modal-title text-white">
+                        <i class="fas fa-envelope me-2"></i>Enviar adjunto al banco
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="enviar_adjunto_id">
+                    <input type="hidden" id="enviar_adjunto_solicitud_id">
+                    <p class="mb-2">
+                        <strong>Archivo:</strong>
+                        <span id="enviar_adjunto_nombre">—</span>
+                    </p>
+                    <div class="mb-3">
+                        <label for="enviar_adjunto_usuario_banco" class="form-label">Usuario banco *</label>
+                        <select class="form-select" id="enviar_adjunto_usuario_banco" required>
+                            <option value="">Cargando...</option>
+                        </select>
+                        <div class="form-text">Solo usuarios banco asignados activamente a esta solicitud.</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary" id="btnConfirmarEnviarAdjuntoBanco" onclick="confirmarEnviarAdjuntoBanco()">
+                        <i class="fas fa-paper-plane me-2"></i>Enviar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Aprobación/Rechazo -->
+    <div class="modal fade" id="aprobacionModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                    <h5 class="modal-title">
+                        <i class="fas fa-gavel me-2"></i>Decisión de Solicitud
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form id="aprobacionForm" onsubmit="return false;">
+                    <div class="modal-body">
+                        <input type="hidden" id="aprobacion_solicitud_id" name="solicitud_id">
+                        
+                        <!-- Información de la Solicitud / Detalles (resumen enviado a bancos) -->
+                        <div class="card mb-4">
+                            <div class="card-header pb-0">
+                                <ul class="nav nav-tabs card-header-tabs" role="tablist">
+                                    <li class="nav-item" role="presentation">
+                                        <button class="nav-link active" id="aprobacion-tab-info" data-bs-toggle="tab" data-bs-target="#aprobacion-pane-info" type="button" role="tab" aria-controls="aprobacion-pane-info" aria-selected="true">
+                                            <i class="fas fa-info-circle me-2"></i>Información de la Solicitud
+                                        </button>
+                                    </li>
+                                    <li class="nav-item" role="presentation">
+                                        <button class="nav-link" id="aprobacion-tab-detalles" data-bs-toggle="tab" data-bs-target="#aprobacion-pane-detalles" type="button" role="tab" aria-controls="aprobacion-pane-detalles" aria-selected="false">
+                                            <i class="fas fa-file-alt me-2"></i>Detalles
+                                        </button>
+                                    </li>
+                                </ul>
+                            </div>
+                            <div class="card-body tab-content">
+                                <div class="tab-pane fade show active" id="aprobacion-pane-info" role="tabpanel" aria-labelledby="aprobacion-tab-info">
+                                    <div id="aprobacionSolicitudInfo">
+                                        <!-- Se carga via JavaScript -->
+                                    </div>
+                                </div>
+                                <div class="tab-pane fade" id="aprobacion-pane-detalles" role="tabpanel" aria-labelledby="aprobacion-tab-detalles">
+                                    <div id="aprobacionSolicitudDetalles" class="resumen-solicitud-detalles" style="max-height: 55vh; overflow-y: auto;">
+                                        <span class="text-muted">Cargando…</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Selección de Vehículo -->
+                        <div class="mb-4">
+                            <label for="vehiculo_evaluacion" class="form-label">Vehículo a Evaluar *</label>
+                            <select class="form-select" id="vehiculo_evaluacion" name="vehiculo_evaluacion" required>
+                                <option value="">Seleccione un vehículo</option>
+                            </select>
+                        </div>
+                        
+                        <!-- Tipo de Decisión -->
+                        <div class="mb-4">
+                            <label for="decision_banco" class="form-label">Decisión *</label>
+                            <select class="form-select" id="decision_banco" name="decision" required onchange="mostrarCamposDecision(this.value)">
+                                <option value="">Seleccione una opción</option>
+                                <option value="preaprobado">Preaprobado</option>
+                                <option value="aprobado">Aprobado</option>
+                                <option value="aprobado_condicional">Aprobado Condicional</option>
+                                <option value="rechazado">Rechazado</option>
+                            </select>
+                        </div>
+
+                        <div class="mb-4" id="wrap_razon_evaluacion" style="display: none;">
+                            <label for="razon_evaluacion" class="form-label">Razón *</label>
+                            <select class="form-select" id="razon_evaluacion" name="razon_evaluacion" disabled>
+                                <option value="">Seleccione una razón...</option>
+                            </select>
+                        </div>
+
+                        <div class="mb-4">
+                            <label for="tasa_bancaria_evaluacion" class="form-label">Tasa bancaria (%) *</label>
+                            <div class="input-group">
+                                <input type="number" class="form-control" id="tasa_bancaria_evaluacion" name="tasa_bancaria" step="0.01" min="0" max="100" required placeholder="Ej: 8.50">
+                                <span class="input-group-text">%</span>
+                            </div>
+                            <div class="form-text">Porcentaje nominal anual ofrecido por el banco.</div>
+                        </div>
+                        
+                        <!-- Campos Condicionales -->
+                        <div id="camposDecision" style="display: none;">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h6 class="mb-0">
+                                        <i class="fas fa-clipboard-list me-2"></i>Detalles de la Evaluación
+                                    </h6>
+                                </div>
+                                <div class="card-body">
+                                    <div class="row">
+                                        <div class="col-md-4">
+                                            <div class="mb-3">
+                                                <label for="valor_financiar" class="form-label">Precio de venta</label>
+                                                <div class="input-group">
+                                                    <span class="input-group-text">$</span>
+                                                    <input type="number" class="form-control" id="valor_financiar" name="valor_financiar" step="0.01" min="0" disabled>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <div class="mb-3">
+                                                <label for="abono_pct_evaluacion" class="form-label">Abono %</label>
+                                                <div class="input-group">
+                                                    <input type="number" class="form-control" id="abono_pct_evaluacion" name="abono_pct_evaluacion" step="0.01" min="0" max="100" disabled placeholder="0.00">
+                                                    <span class="input-group-text">%</span>
+                                                </div>
+                                                <div class="form-text">Al ingresar el %, calcula el Abono $ según el Precio de venta.</div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <div class="mb-3">
+                                                <label for="abono_evaluacion" class="form-label">Abono $</label>
+                                                <div class="input-group">
+                                                    <span class="input-group-text">$</span>
+                                                    <input type="number" class="form-control" id="abono_evaluacion" name="abono_evaluacion" step="0.01" min="0" disabled>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="row">
+                                        <div class="col-md-4">
+                                            <div class="mb-3">
+                                                <label for="plazo_evaluacion" class="form-label">Plazo (Meses)</label>
+                                                <input type="number" class="form-control" id="plazo_evaluacion" name="plazo_evaluacion" min="1" disabled>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <div class="mb-3">
+                                                <label for="letra_evaluacion" class="form-label">Letra (monto mensual)</label>
+                                                <div class="input-group">
+                                                    <span class="input-group-text">$</span>
+                                                    <input type="number" class="form-control" id="letra_evaluacion" name="letra_evaluacion" step="0.01" min="0" disabled>
+                                                </div>
+                                                <div class="form-text">Al ingresarla, la letra quincenal se completa como la mitad.</div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <div class="mb-3">
+                                                <label for="letra_quincenal_evaluacion" class="form-label">Letra (monto quincenal)</label>
+                                                <div class="input-group">
+                                                    <span class="input-group-text">$</span>
+                                                    <input type="number" class="form-control" id="letra_quincenal_evaluacion" name="letra_quincenal_evaluacion" step="0.01" min="0" disabled>
+                                                </div>
+                                                <div class="form-text">Ingrese el monto de la letra quincenal.</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="row">
+                                        <div class="col-md-6">
+                                            <div class="mb-3">
+                                                <label for="promocion_evaluacion" class="form-label">Promoción</label>
+                                                <select class="form-select" id="promocion_evaluacion" name="promocion_evaluacion" disabled>
+                                                    <option value="">Seleccione una promoción...</option>
+                                                    <option value="Servicios de Mantenimiento">Servicios de Mantenimiento</option>
+                                                    <option value="Cash Back para abono">Cash Back para abono</option>
+                                                    <option value="Cargo en Cta de Ahorro">Cargo en Cta de Ahorro</option>
+                                                    <option value="Póliza de Auto (1er año)">Póliza de Auto (1er año)</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6" id="wrap_cuantia_evaluacion" style="display: none;">
+                                            <div class="mb-3">
+                                                <label for="cuantia_evaluacion" class="form-label">Cuantía</label>
+                                                <div class="input-group">
+                                                    <span class="input-group-text">$</span>
+                                                    <input type="number" class="form-control" id="cuantia_evaluacion" name="cuantia_evaluacion" step="0.01" min="0" disabled placeholder="0.00">
+                                                </div>
+                                                <div class="form-text">Monto asociado a la promoción seleccionada.</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="mb-3">
+                                        <label for="comentarios_evaluacion" class="form-label">
+                                            Comentarios <span id="comentarios_obligatorio_mark" class="text-danger d-none">*</span>
+                                        </label>
+                                        <textarea class="form-control" id="comentarios_evaluacion" name="comentarios_evaluacion" rows="3" placeholder="Comentarios adicionales..." disabled></textarea>
+                                        <div class="form-text d-none" id="comentarios_rechazo_hint">En un rechazo el comentario es obligatorio.</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                        <button type="submit" class="btn btn-primary" onclick="procesarAprobacion()">
+                            <i class="fas fa-gavel me-2"></i>Procesar Decisión
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Cambio de Estado (Admin / Gestor) -->
+    <div class="modal fade" id="cambioEstadoModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header" style="background: linear-gradient(135deg, #ffc107 0%, #ff8c00 100%);">
+                    <h5 class="modal-title">
+                        <i class="fas fa-cogs me-2"></i>Cambiar Estado de Solicitud
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form id="cambioEstadoForm" onsubmit="return false;">
+                    <div class="modal-body">
+                        <input type="hidden" id="cambio_estado_solicitud_id" name="solicitud_id">
+                        
+                        <!-- Información de la Solicitud -->
+                        <div class="card mb-4">
+                            <div class="card-header">
+                                <h6 class="mb-0">
+                                    <i class="fas fa-info-circle me-2"></i>Información de la Solicitud
+                                </h6>
+                            </div>
+                            <div class="card-body">
+                                <div id="cambioEstadoSolicitudInfo">
+                                    <!-- Se carga via JavaScript -->
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Estado Actual -->
+                        <div class="mb-3">
+                            <label class="form-label">Estado Actual</label>
+                            <div id="estado_actual_display" class="form-control-plaintext">
+                                <!-- Se carga via JavaScript -->
+                            </div>
+                        </div>
+                        
+                        <!-- Nuevo Estado -->
+                        <div class="mb-4">
+                            <label for="nuevo_estado" class="form-label">Nuevo Estado *</label>
+                            <select class="form-select" id="nuevo_estado" name="nuevo_estado" required>
+                                <option value="">Seleccionar nuevo estado...</option>
+                                <option value="Reevaluación por los Bancos">🔁 Reevaluación por los Bancos</option>
+                                <option value="Evaluacion">Evaluacion</option>
+                                <option value="Comité">Comité</option>
+                                <option value="Reconsideración">Reconsideración</option>
+                                <option value="Pre Aprobado">Pre Aprobado</option>
+                                <option value="Aprobado con Condición">Aprobado con Condición</option>
+                                <option value="Pend. Firma">Pend. Firma</option>
+                                <option value="Pend. Poliza">Pend. Poliza</option>
+                                <option value="Pend. Abono">Pend. Abono</option>
+                                <option value="Pend. Abono y poliza">Pend. Abono y poliza</option>
+                                <option value="Pend. CPP">Pend. CPP</option>
+                                <option value="Aprobada">✅ Aprobada</option>
+                                <option value="Rechazada">❌ Rechazada</option>
+                                <option value="Completada">🎉 Completada</option>
+                                <option value="Desistimiento">🚫 Desistimiento</option>
+                            </select>
+                            <div class="form-text">Los estados «Pend.» solo marcan seguimiento operativo; no alteran evaluaciones ni el flujo bancario.</div>
+                        </div>
+                        
+                        <!-- Campo de Nota -->
+                        <div class="mb-3">
+                            <label for="nota_cambio_estado" class="form-label">Nota del Cambio *</label>
+                            <textarea class="form-control" id="nota_cambio_estado" name="nota_cambio_estado" rows="4" required placeholder="Explique el motivo del cambio de estado..."></textarea>
+                            <div class="form-text">Esta nota se agregará automáticamente al muro de la solicitud</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label mb-2">
+                                <i class="fas fa-history me-1"></i>Notas de cambio de estado
+                                <span id="notas_cambio_estado_count" class="text-muted small"></span>
+                            </label>
+                            <div class="table-responsive border rounded" style="max-height: 240px;">
+                                <table class="table table-sm table-striped table-hover mb-0 align-middle" id="tablaNotasCambioEstado">
+                                    <thead class="table-light sticky-top">
+                                        <tr>
+                                            <th style="white-space:nowrap;">Fecha</th>
+                                            <th>Usuario</th>
+                                            <th>De</th>
+                                            <th>A</th>
+                                            <th>Nota</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr>
+                                            <td colspan="5" class="text-center text-muted">Cargando notas...</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        
+                        <!-- Campos adicionales para estados específicos -->
+                        <div id="campos_adicionales_estado" style="display: none;">
+                            <!-- Se mostrarán campos específicos según el estado seleccionado -->
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                        <button type="submit" class="btn btn-warning" onclick="procesarCambioEstado()">
+                            <i class="fas fa-cogs me-2"></i>Cambiar Estado
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    window.AUTOS_DISPONIBLES_API = '<?php echo htmlspecialchars((rtrim(dirname($_SERVER["SCRIPT_NAME"]), "/") ?: "") . "/api/autos_disponibles.php"); ?>';
+    window.MOTUS_ES_HISTORICO = <?php echo $esHistorico ? 'true' : 'false'; ?>;
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        var inputEj = document.getElementById('buscar_ejecutivo');
+        var selectEj = document.getElementById('ejecutivo_ventas_id');
+        var listaEj = document.getElementById('ejecutivo_lista');
+        if (!inputEj || !selectEj || !listaEj) return;
+
+        var opciones = [];
+        for (var i = 0; i < selectEj.options.length; i++) {
+            var opt = selectEj.options[i];
+            if (!opt.value) continue;
+            opciones.push({ id: opt.value, text: opt.textContent.trim(), search: (opt.getAttribute('data-search') || opt.textContent).toLowerCase() });
+        }
+
+        function mostrarLista(term) {
+            term = (term || '').toLowerCase().trim();
+            var html = '';
+            if (term === '') {
+                html = '<a href="#" class="list-group-item list-group-item-action" data-id="" data-text="">Sin ejecutivo asignado</a>';
+            }
+            for (var j = 0; j < opciones.length; j++) {
+                if (term && opciones[j].search.indexOf(term) === -1) continue;
+                html += '<a href="#" class="list-group-item list-group-item-action" data-id="' + opciones[j].id + '" data-text="' + opciones[j].text.replace(/"/g, '&quot;') + '">' + opciones[j].text + '</a>';
+            }
+            listaEj.innerHTML = html;
+            listaEj.style.display = html ? 'block' : 'none';
+
+            listaEj.querySelectorAll('a').forEach(function (a) {
+                a.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    var id = a.getAttribute('data-id');
+                    var text = a.getAttribute('data-text') || '';
+                    selectEj.value = id;
+                    inputEj.value = text;
+                    listaEj.style.display = 'none';
+                });
+            });
+        }
+
+        inputEj.addEventListener('input', function () {
+            mostrarLista(inputEj.value);
+        });
+        inputEj.addEventListener('focus', function () {
+            // Al hacer foco mostrar toda la lista para poder cambiar de ejecutivo
+            mostrarLista('');
+        });
+
+        document.addEventListener('click', function (e) {
+            if (e.target !== inputEj && e.target !== listaEj && !listaEj.contains(e.target)) {
+                listaEj.style.display = 'none';
+            }
+        });
+        inputEj.addEventListener('blur', function () {
+            setTimeout(function () {
+                var sel = selectEj.options[selectEj.selectedIndex];
+                if (sel && sel.value && inputEj.value !== sel.textContent.trim()) {
+                    inputEj.value = sel.textContent.trim();
+                }
+                if (!selectEj.value && inputEj.value) {
+                    inputEj.value = '';
+                }
+            }, 200);
+        });
+    });
+    </script>
+    <script>
+          // Pasar información del rol a JavaScript
+          window.userRoles = {
+              isAdmin: <?php echo $isAdmin ? 'true' : 'false'; ?>,
+              isGestor: <?php echo $isGestor ? 'true' : 'false'; ?>,
+              isBanco: <?php echo $isBanco ? 'true' : 'false'; ?>,
+              isAdminBanco: <?php echo $isAdminBanco ? 'true' : 'false'; ?>,
+              isBancoAnalista: <?php echo $isBancoAnalista ? 'true' : 'false'; ?>
+          };
+          // Pasar ID del usuario a JavaScript
+          window.userId = <?php echo (int) $_SESSION['user_id']; ?>;
+          window.userBancoId = <?php echo $bancoIdSesion ? (int) $bancoIdSesion : 'null'; ?>;
+
+        // Cache vehículos del modal de decisión (usuario banco)
+        var aprobacionVehiculosCache = [];
+        var aprobacionSolicitudCache = null;
+
+        function aprobacionFmtMoney(v) {
+            if (v === null || v === undefined || v === '') return '—';
+            var n = parseFloat(v);
+            if (!isFinite(n)) return '—';
+            return '$' + n.toLocaleString('es-PA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function aprobacionEsc(s) {
+            if (s == null || s === '') return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function renderAprobacionSolicitudInfo(vehiculoId) {
+            var solicitud = aprobacionSolicitudCache || {};
+            var perfil = solicitud.perfil_financiero || '—';
+            var html = `
+                <div class="row">
+                    <div class="col-md-6">
+                        <strong>Cliente:</strong> ${aprobacionEsc(solicitud.nombre_cliente || '—')}<br>
+                        <strong>Cédula:</strong> ${aprobacionEsc(solicitud.cedula || '—')}<br>
+                        <strong>Teléfono:</strong> ${aprobacionEsc(solicitud.telefono || '—')}<br>
+                        <strong>Perfil:</strong> <span class="badge bg-secondary">${aprobacionEsc(perfil)}</span><br>
+                        <strong>Gestor:</strong> ${aprobacionEsc((solicitud.gestor_nombre || '') + ' ' + (solicitud.gestor_apellido || '')).trim() || '—'}<br>
+                        <strong>Estado:</strong> <span class="badge bg-info">${aprobacionEsc(solicitud.estado || '—')}</span>
+                    </div>
+                    <div class="col-md-6" id="aprobacionVehiculoDetalle">
+            `;
+
+            var veh = null;
+            if (vehiculoId) {
+                for (var i = 0; i < aprobacionVehiculosCache.length; i++) {
+                    if (String(aprobacionVehiculosCache[i].id) === String(vehiculoId)) {
+                        veh = aprobacionVehiculosCache[i];
+                        break;
+                    }
+                }
+            }
+
+            if (veh) {
+                var abonoPct = (veh.abono_porcentaje != null && veh.abono_porcentaje !== '')
+                    ? aprobacionEsc(veh.abono_porcentaje) + '%'
+                    : '—';
+                var estaReservada = parseInt(veh.apartado, 10) === 1;
+                var reservaHtml = estaReservada
+                    ? '<span class="badge bg-success">Sí — unidad reservada / apartada</span>'
+                    : '<span class="badge bg-warning text-dark">No — sin reserva aplicada</span>';
+                html += `
+                        <div class="border rounded p-2 bg-light">
+                            <div class="fw-semibold mb-1"><i class="fas fa-car me-1"></i>Vehículo seleccionado</div>
+                            <strong>Unidad:</strong> ${aprobacionEsc(veh.unidad || '—')}<br>
+                            <strong>¿Reservada?:</strong> ${reservaHtml}<br>
+                            <strong>Marca:</strong> ${aprobacionEsc(veh.marca || '—')}<br>
+                            <strong>Modelo:</strong> ${aprobacionEsc(veh.modelo || '—')}<br>
+                            <strong>Año:</strong> ${aprobacionEsc(veh.anio || '—')}<br>
+                            <strong>Kilometraje:</strong> ${aprobacionEsc(veh.kilometraje || '—')}<br>
+                            <strong>Precio:</strong> ${aprobacionFmtMoney(veh.precio)}<br>
+                            <strong>Abono %:</strong> ${abonoPct}<br>
+                            <strong>Abono $:</strong> ${aprobacionFmtMoney(veh.abono_monto)}
+                        </div>
+                `;
+            } else {
+                html += '<span class="text-muted">Seleccione un vehículo para ver sus datos.</span>';
+            }
+
+            html += `
+                    </div>
+                </div>
+            `;
+            $('#aprobacionSolicitudInfo').html(html);
+        }
+
+        function cargarAprobacionDetalles(solicitudId) {
+            var $det = $('#aprobacionSolicitudDetalles');
+            $det.html('<span class="text-muted">Cargando…</span>');
+            $.ajax({
+                url: 'api/resumen_solicitud.php',
+                type: 'GET',
+                data: { solicitud_id: solicitudId },
+                dataType: 'json',
+                success: function(response) {
+                    if (String($('#aprobacion_solicitud_id').val()) !== String(solicitudId)) {
+                        return;
+                    }
+                    if (response && response.success) {
+                        $det.html(response.html || '<span class="text-muted">Sin datos.</span>');
+                    } else {
+                        $det.html('<span class="text-danger">' + aprobacionEsc((response && response.message) || 'No se pudo cargar el resumen') + '</span>');
+                    }
+                },
+                error: function() {
+                    $det.html('<span class="text-danger">No se pudo cargar el resumen</span>');
+                }
+            });
+        }
+
+        // Función para abrir modal de aprobación
+        function abrirModalAprobacion(solicitudId) {
+            // Limpiar formulario
+            $('#aprobacionForm')[0].reset();
+            $('#camposDecision').hide();
+            actualizarCampoRazonDecision('');
+            $('#aprobacion_solicitud_id').val(solicitudId);
+            aprobacionVehiculosCache = [];
+            aprobacionSolicitudCache = null;
+            bootstrap.Tab.getOrCreateInstance(document.getElementById('aprobacion-tab-info')).show();
+            cargarAprobacionDetalles(solicitudId);
+            
+            // Obtener información de la solicitud
+            $.ajax({
+                url: 'api/solicitudes.php',
+                type: 'GET',
+                data: { id: solicitudId },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        aprobacionSolicitudCache = response.data;
+                        renderAprobacionSolicitudInfo(null);
+                        // Cargar vehículos
+                        cargarVehiculosParaEvaluacion(solicitudId);
+                    } else {
+                        alert('Error al cargar la solicitud: ' + response.message);
+                    }
+                },
+                error: function() {
+                    alert('Error al cargar la información de la solicitud');
+                }
+            });
+        }
+
+        // Función para cargar vehículos para evaluación
+        function cargarVehiculosParaEvaluacion(solicitudId) {
+            $.ajax({
+                url: 'api/vehiculos_solicitud.php',
+                type: 'GET',
+                data: { solicitud_id: solicitudId },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        aprobacionVehiculosCache = Array.isArray(response.data) ? response.data : [];
+                        const $select = $('#vehiculo_evaluacion');
+                        $select.empty().append('<option value="">Seleccione un vehículo</option>');
+                        
+                        if (aprobacionVehiculosCache.length > 0) {
+                            aprobacionVehiculosCache.forEach(function(vehiculo) {
+                                const reservada = parseInt(vehiculo.apartado, 10) === 1 ? ' [Reservada]' : '';
+                                const unidadTxt = vehiculo.unidad ? ` · ${vehiculo.unidad}` : '';
+                                const text = `${vehiculo.marca || 'N/A'} ${vehiculo.modelo || ''}`.trim()
+                                    + (vehiculo.anio ? ` (${vehiculo.anio})` : '')
+                                    + unidadTxt
+                                    + reservada;
+                                $select.append(`<option value="${vehiculo.id}">${text}</option>`);
+                            });
+                        } else {
+                            $select.append('<option value="">No hay vehículos registrados</option>');
+                        }
+                        
+                        // Mostrar modal después de cargar vehículos
+                        $('#aprobacionModal').modal('show');
+                        renderAprobacionSolicitudInfo($select.val());
+                    } else {
+                        aprobacionVehiculosCache = [];
+                        $('#vehiculo_evaluacion').empty().append('<option value="">Error al cargar vehículos</option>');
+                        $('#aprobacionModal').modal('show');
+                    }
+                },
+                error: function() {
+                    aprobacionVehiculosCache = [];
+                    $('#vehiculo_evaluacion').empty().append('<option value="">Error al cargar vehículos</option>');
+                    $('#aprobacionModal').modal('show');
+                }
+            });
+        }
+
+        // Al cambiar el vehículo, refrescar datos y sugerir valores del vehículo (sin cálculos automáticos)
+        $(document).on('change', '#vehiculo_evaluacion', function() {
+            var vid = $(this).val();
+            renderAprobacionSolicitudInfo(vid);
+            if (!vid) return;
+            for (var i = 0; i < aprobacionVehiculosCache.length; i++) {
+                if (String(aprobacionVehiculosCache[i].id) === String(vid)) {
+                    var v = aprobacionVehiculosCache[i];
+                    if (!$('#abono_evaluacion').prop('disabled')) {
+                        if (v.abono_porcentaje != null && v.abono_porcentaje !== '') {
+                            $('#abono_pct_evaluacion').val(v.abono_porcentaje);
+                        } else {
+                            $('#abono_pct_evaluacion').val('');
+                        }
+                        if (v.abono_monto != null && v.abono_monto !== '') {
+                            $('#abono_evaluacion').val(v.abono_monto);
+                        } else {
+                            $('#abono_evaluacion').val('');
+                        }
+                        var precioInit = parseFloat(v.precio);
+                        if (isFinite(precioInit) && precioInit > 0 && !$('#valor_financiar').prop('disabled')) {
+                            $('#valor_financiar').val(precioInit.toFixed(2));
+                        }
+                    }
+                    break;
+                }
+            }
+        });
+
+        // Abono $ = Precio de venta × Abono % / 100; Letra quincenal = Letra mensual / 2.
+        window.calcularAbonoDesdePct = function() {
+            if ($('#abono_pct_evaluacion').prop('disabled') || $('#abono_evaluacion').prop('disabled')) {
+                return;
+            }
+            var precio = parseFloat($('#valor_financiar').val());
+            var pct = parseFloat($('#abono_pct_evaluacion').val());
+            if (!isFinite(precio) || precio <= 0 || !isFinite(pct) || pct < 0) {
+                return;
+            }
+            $('#abono_evaluacion').val((precio * pct / 100).toFixed(2));
+        };
+
+        window.calcularLetraQuincenalDesdeMensual = function() {
+            if ($('#letra_evaluacion').prop('disabled') || $('#letra_quincenal_evaluacion').prop('disabled')) {
+                return;
+            }
+            var mensual = parseFloat($('#letra_evaluacion').val());
+            if (!isFinite(mensual) || mensual < 0) {
+                return;
+            }
+            $('#letra_quincenal_evaluacion').val((mensual / 2).toFixed(2));
+        };
+
+        $(document).on('input change', '#abono_pct_evaluacion', function() {
+            calcularAbonoDesdePct();
+        });
+        $(document).on('input change', '#valor_financiar', function() {
+            calcularAbonoDesdePct();
+        });
+        $(document).on('input change', '#letra_evaluacion', function() {
+            calcularLetraQuincenalDesdeMensual();
+        });
+
+        window.actualizarCampoCuantiaPromocion = function() {
+            var tienePromo = (($('#promocion_evaluacion').val() || '').trim() !== '');
+            var decisionHabilitada = !$('#promocion_evaluacion').prop('disabled');
+            if (tienePromo && decisionHabilitada) {
+                $('#wrap_cuantia_evaluacion').show();
+                $('#cuantia_evaluacion').prop('disabled', false);
+            } else {
+                $('#wrap_cuantia_evaluacion').hide();
+                $('#cuantia_evaluacion').prop('disabled', true);
+                if (!tienePromo) {
+                    $('#cuantia_evaluacion').val('');
+                }
+            }
+        };
+
+        window.actualizarCampoRazonDecision = function(decision) {
+            var razonesCondicionales = [
+                'Documentación pendiente o actualización de información',
+                'Validación de ingresos y estabilidad laboral',
+                'Presentar carta laboral actualizada',
+                'Presentar codeudor o fiador',
+                'Corrección de observaciones crediticias',
+                'Aprobación o validación interna requerida',
+                'Se recomienda incrementar abono y/o evaluar un auto de menor precio',
+                'Corregir discrepancias en buró de crédito',
+                'Cumplir antigüedad laboral mínima requerida',
+                'Sujeto a aprobación de comité de crédito'
+            ];
+            var razonesRechazo = [
+                'Capacidad de pago insuficiente',
+                'Endeudamiento elevado',
+                'Historial crediticio desfavorable',
+                'Incumplimiento de políticas de crédito',
+                'Inestabilidad laboral',
+                'Negocio propio sin suficiente trayectoria',
+                'Inconsistencias entre lo declarado y lo evidenciado',
+                'Perfil de riesgo no aceptable',
+                'Empresa no elegible según política de crédito vigente'
+            ];
+
+            var opciones = [];
+            if (decision === 'preaprobado' || decision === 'aprobado_condicional') {
+                opciones = razonesCondicionales;
+            } else if (decision === 'rechazado') {
+                opciones = razonesRechazo;
+            }
+
+            var $select = $('#razon_evaluacion');
+            $select.empty().append($('<option>', {
+                value: '',
+                text: 'Seleccione una razón...'
+            }));
+            opciones.forEach(function(razon) {
+                $select.append($('<option>', {
+                    value: razon,
+                    text: razon
+                }));
+            });
+
+            if (opciones.length > 0) {
+                $('#wrap_razon_evaluacion').show();
+                $select.prop('disabled', false).prop('required', true);
+            } else {
+                $('#wrap_razon_evaluacion').hide();
+                $select.prop('disabled', true).prop('required', false).val('');
+            }
+        };
+
+        $(document).on('change', '#promocion_evaluacion', function() {
+            actualizarCampoCuantiaPromocion();
+        });
+
+        window.mostrarCamposDecision = function(decision) {
+            const campos = ['#valor_financiar', '#abono_pct_evaluacion', '#abono_evaluacion', '#plazo_evaluacion', '#letra_evaluacion', '#letra_quincenal_evaluacion', '#promocion_evaluacion', '#cuantia_evaluacion', '#comentarios_evaluacion', '#razon_evaluacion'];
+            campos.forEach(function(campo) {
+                $(campo).prop('disabled', true);
+                $(campo).prop('required', false);
+            });
+
+            $('#camposDecision').show();
+            actualizarCampoRazonDecision(decision);
+
+            if (decision === 'rechazado') {
+                $('#comentarios_evaluacion').prop('disabled', false);
+                $('#comentarios_evaluacion').prop('required', true);
+                $('#comentarios_obligatorio_mark').removeClass('d-none');
+                $('#comentarios_rechazo_hint').removeClass('d-none');
+                $('#comentarios_evaluacion').attr('placeholder', 'Explique el rechazo (obligatorio)...');
+                $('#letra_evaluacion').val('');
+                $('#letra_quincenal_evaluacion').val('');
+                $('#promocion_evaluacion').val('');
+                actualizarCampoCuantiaPromocion();
+            } else if (decision === 'preaprobado' || decision === 'aprobado' || decision === 'aprobado_condicional') {
+                ['#valor_financiar', '#abono_pct_evaluacion', '#abono_evaluacion', '#plazo_evaluacion', '#letra_evaluacion', '#letra_quincenal_evaluacion', '#promocion_evaluacion', '#comentarios_evaluacion'].forEach(function(campo) {
+                    $(campo).prop('disabled', false).prop('readonly', false);
+                });
+                $('#comentarios_evaluacion').prop('required', false);
+                $('#comentarios_obligatorio_mark').addClass('d-none');
+                $('#comentarios_rechazo_hint').addClass('d-none');
+                $('#comentarios_evaluacion').attr('placeholder', 'Comentarios adicionales...');
+                actualizarCampoCuantiaPromocion();
+            } else {
+                $('#camposDecision').hide();
+                $('#comentarios_obligatorio_mark').addClass('d-none');
+                $('#comentarios_rechazo_hint').addClass('d-none');
+                actualizarCampoCuantiaPromocion();
+            }
+        };
+
+        function avisarPropuestaYaSeleccionada(message) {
+            const msg = message || 'Esta solicitud ya tiene una propuesta seleccionada de otra entidad. Su evaluación/decisión no será procesada.';
+            alert(msg);
+            $('#aprobacionModal').modal('hide');
+            location.reload();
+        }
+
+        // Función para procesar la aprobación
+        function procesarAprobacion() {
+            const formData = new FormData($('#aprobacionForm')[0]);
+            
+            // Validar formulario
+            if (!$('#aprobacionForm')[0].checkValidity()) {
+                $('#aprobacionForm')[0].reportValidity();
+                return;
+            }
+            
+            const decision = $('#decision_banco').val();
+            if (!decision) {
+                alert('Por favor seleccione una decisión');
+                return;
+            }
+
+            if (decision === 'rechazado') {
+                const comentarios = ($('#comentarios_evaluacion').val() || '').trim();
+                if (!comentarios) {
+                    alert('En un rechazo el comentario es obligatorio');
+                    $('#comentarios_evaluacion').focus();
+                    return;
+                }
+            }
+
+            const solicitudId = $('#aprobacion_solicitud_id').val();
+            
+            // Confirmar acción
+            const mensaje = '¿Está seguro de procesar esta decisión: "' + decision.replace('_', ' ').toUpperCase() + '"?';
+                
+            if (!confirm(mensaje)) {
+                return;
+            }
+
+            const enviarDecision = function() {
+                $.ajax({
+                    url: 'api/evaluaciones_banco.php',
+                    type: 'POST',
+                    data: formData,
+                    processData: false,
+                    contentType: false,
+                    dataType: 'json',
+                    success: function(response) {
+                        if (response.success) {
+                            alert(response.message);
+                            $('#aprobacionModal').modal('hide');
+                            location.reload();
+                        } else if (response.code === 'PROPUESTA_YA_SELECCIONADA') {
+                            avisarPropuestaYaSeleccionada(response.message);
+                        } else {
+                            alert(response.message || 'No se pudo procesar la decisión');
+                        }
+                    },
+                    error: function(xhr) {
+                        let errorMsg = 'Error al procesar la decisión';
+                        let parsed = null;
+                        if (xhr.responseText) {
+                            try {
+                                parsed = JSON.parse(xhr.responseText);
+                                errorMsg = parsed.message || errorMsg;
+                            } catch (e) {
+                                errorMsg = xhr.responseText;
+                            }
+                        }
+                        if (parsed && parsed.code === 'PROPUESTA_YA_SELECCIONADA') {
+                            avisarPropuestaYaSeleccionada(parsed.message);
+                            return;
+                        }
+                        alert(errorMsg);
+                    }
+                });
+            };
+
+            // Chequeo previo: si el gestor ya eligió otra entidad mientras esta modal estaba abierta
+            $.ajax({
+                url: 'api/evaluaciones_banco.php',
+                type: 'GET',
+                data: { solicitud_id: solicitudId },
+                dataType: 'json'
+            }).done(function(response) {
+                if (response.success
+                    && response.evaluacion_seleccionada
+                    && response.usuario_banco_id_seleccionado
+                    && String(response.usuario_banco_id_seleccionado) !== String(window.userId || '')
+                ) {
+                    avisarPropuestaYaSeleccionada(
+                        'Esta solicitud ya tiene una propuesta seleccionada de otra entidad bancaria. '
+                        + 'Su evaluación/decisión no será procesada. Actualice la página para ver el estado actual.'
+                    );
+                    return;
+                }
+                enviarDecision();
+            }).fail(function() {
+                // Si falla el chequeo, el POST igual aplica la regla en servidor
+                enviarDecision();
+            });
+        }
+
+        function escapeHtmlCambioEstado(str) {
+            if (str == null || str === '') return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function formatearFechaCambioEstado(fecha) {
+            if (!fecha) return '-';
+            var d = new Date(String(fecha).replace(' ', 'T'));
+            if (isNaN(d.getTime())) return escapeHtmlCambioEstado(fecha);
+            return d.toLocaleString('es-PA', { dateStyle: 'short', timeStyle: 'short' });
+        }
+
+        function renderNotasCambioEstado(rows) {
+            var $tbody = $('#tablaNotasCambioEstado tbody');
+            var $count = $('#notas_cambio_estado_count');
+            if (!rows || !rows.length) {
+                $count.text('');
+                $tbody.html('<tr><td colspan="5" class="text-center text-muted">No hay notas de cambio de estado para esta solicitud.</td></tr>');
+                return;
+            }
+            $count.text('(' + rows.length + ')');
+            var html = '';
+            rows.forEach(function(row) {
+                html += '<tr>'
+                    + '<td class="text-nowrap">' + formatearFechaCambioEstado(row.fecha) + '</td>'
+                    + '<td>' + escapeHtmlCambioEstado(row.usuario || 'Sistema') + '</td>'
+                    + '<td>' + escapeHtmlCambioEstado(row.estado_anterior || '-') + '</td>'
+                    + '<td>' + escapeHtmlCambioEstado(row.estado_nuevo || '-') + '</td>'
+                    + '<td style="white-space:normal;word-break:break-word;">' + escapeHtmlCambioEstado(row.nota || '-') + '</td>'
+                    + '</tr>';
+            });
+            $tbody.html(html);
+        }
+
+        function cargarNotasCambioEstado(solicitudId) {
+            $('#notas_cambio_estado_count').text('');
+            $('#tablaNotasCambioEstado tbody').html('<tr><td colspan="5" class="text-center text-muted"><i class="fas fa-spinner fa-spin me-2"></i>Cargando notas...</td></tr>');
+            $.ajax({
+                url: 'api/solicitudes.php',
+                type: 'GET',
+                data: { action: 'notas_cambio_estado', solicitud_id: solicitudId },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        renderNotasCambioEstado(response.data || []);
+                    } else {
+                        $('#tablaNotasCambioEstado tbody').html(
+                            '<tr><td colspan="5" class="text-center text-danger">' + escapeHtmlCambioEstado(response.message || 'Error al cargar notas') + '</td></tr>'
+                        );
+                    }
+                },
+                error: function() {
+                    $('#tablaNotasCambioEstado tbody').html(
+                        '<tr><td colspan="5" class="text-center text-danger">Error al cargar las notas de cambio de estado.</td></tr>'
+                    );
+                }
+            });
+        }
+
+        // Función para abrir modal de cambio de estado (Admin / Gestor)
+        function abrirModalCambioEstado(solicitudId) {
+            // Limpiar formulario
+            $('#cambioEstadoForm')[0].reset();
+            $('#campos_adicionales_estado').hide();
+            $('#cambio_estado_solicitud_id').val(solicitudId);
+            cargarNotasCambioEstado(solicitudId);
+            
+            // Obtener información de la solicitud
+            $.ajax({
+                url: 'api/solicitudes.php',
+                type: 'GET',
+                data: { id: solicitudId },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        const solicitud = response.data;
+                        
+                        // Mostrar información de la solicitud
+                        $('#cambioEstadoSolicitudInfo').html(`
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <strong>Cliente:</strong> ${solicitud.nombre_cliente}<br>
+                                    <strong>Cédula:</strong> ${solicitud.cedula}<br>
+                                    <strong>Vehículo:</strong> ${solicitud.marca_auto || 'N/A'} ${solicitud.modelo_auto || ''}
+                                </div>
+                                <div class="col-md-6">
+                                    <strong>Gestor:</strong> ${solicitud.gestor_nombre} ${solicitud.gestor_apellido}<br>
+                                    <strong>Precio:</strong> $${solicitud.precio_especial || 'N/A'}<br>
+                                    <strong>Fecha Creación:</strong> ${new Date(solicitud.fecha_creacion).toLocaleDateString('es-ES')}
+                                </div>
+                            </div>
+                        `);
+                        
+                        // Mostrar estado actual
+                        const estadoClass = getEstadoClass(solicitud.estado);
+                        $('#estado_actual_display').html(`
+                            <span class="badge badge-estado ${estadoClass}">${solicitud.estado}</span>
+                        `);
+                        
+                        // Mostrar modal
+                        $('#cambioEstadoModal').modal('show');
+                    } else {
+                        alert('Error al cargar la solicitud: ' + response.message);
+                    }
+                },
+                error: function() {
+                    alert('Error al cargar la información de la solicitud');
+                }
+            });
+        }
+
+        // Función para procesar cambio de estado
+        function procesarCambioEstado() {
+            const formData = new FormData($('#cambioEstadoForm')[0]);
+            
+            // Validar formulario
+            if (!$('#cambioEstadoForm')[0].checkValidity()) {
+                $('#cambioEstadoForm')[0].reportValidity();
+                return;
+            }
+            
+            const nuevoEstado = $('#nuevo_estado').val();
+            const nota = $('#nota_cambio_estado').val();
+            
+            if (!nuevoEstado || !nota.trim()) {
+                alert('Por favor complete todos los campos requeridos');
+                return;
+            }
+            
+            // Confirmar cambio
+            if (!confirm(`¿Está seguro de cambiar el estado a "${nuevoEstado}"?`)) {
+                return;
+            }
+            
+            // Enviar datos
+            $.ajax({
+                url: 'api/solicitudes.php',
+                type: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        var estadosHistorico = ['Completada', 'Rechazada', 'Desistimiento'];
+                        var msg = response.message;
+                        if (estadosHistorico.indexOf(nuevoEstado) !== -1 && !window.MOTUS_ES_HISTORICO) {
+                            msg += '\n\nLa solicitud se movió al Histórico de Solicitudes.';
+                        }
+                        alert(msg);
+                        $('#cambioEstadoModal').modal('hide');
+                        location.reload();
+                    } else {
+                        alert('Error: ' + response.message);
+                    }
+                },
+                error: function() {
+                    alert('Error al procesar el cambio de estado');
+                }
+            });
+        }
+    </script>
+
+    <!-- Modal confirmar envío de resumen por correo al usuario banco -->
+    <div class="modal fade" id="modalEnviarResumenBanco" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-envelope me-2"></i>Enviar resumen por correo
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-2">¿Desea enviar por correo un resumen de la solicitud (datos generales, perfil financiero, datos del auto, análisis y adjuntos) a <strong class="resumen-destino"></strong>?</p>
+                    <p class="small text-muted mb-0">En copia (CC) también recibirán el correo quien envía, el email Pipedrive de la solicitud si existe, y el <strong>ejecutivo de ventas</strong> seleccionado en Datos generales cuando tenga correo registrado.</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary" onclick="confirmarEnviarResumenBanco()">
+                        <i class="fas fa-paper-plane me-1"></i>Enviar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal confirmar envío de resumen a todos los usuarios banco -->
+    <div class="modal fade" id="modalEnviarResumenBancoTodos" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-envelope me-2"></i>Enviar resumen a todos
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-2">¿Desea enviar por correo un resumen de la solicitud (datos generales, perfil financiero, datos del auto, análisis y adjuntos) a <strong><span class="resumen-todos-cantidad">0</span></strong> usuario(s) banco asignado(s)?</p>
+                    <p class="small text-muted mb-0">Se enviará un solo correo con los usuarios banco en copia oculta (CCO), y con vendedor en copia (CC) cuando exista; las respuestas irán al gestor asignado.</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary" onclick="confirmarEnviarResumenBancoTodos()">
+                        <i class="fas fa-paper-plane me-1"></i>Enviar a todos
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para ver Usuarios Banco Asignados -->
+    <div class="modal fade" id="modalUsuariosBanco" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header bg-info text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-users me-2"></i>Usuarios Banco Asignados
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="usuariosBancoContent">
+                        <div class="text-center">
+                            <div class="spinner-border text-info" role="status">
+                                <span class="visually-hidden">Cargando...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+          </div>
+
+      <!-- Modal para Cambiar Gestor (Solo Admin) -->
+      <div class="modal fade" id="modalCambiarGestor" tabindex="-1">
+          <div class="modal-dialog">
+              <div class="modal-content">
+                  <div class="modal-header bg-primary text-white">
+                      <h5 class="modal-title">
+                          <i class="fas fa-user-edit me-2"></i>Cambiar Gestor
+                      </h5>
+                      <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                  </div>
+                  <div class="modal-body">
+                      <input type="hidden" id="gestor_solicitud_id">
+                      <div class="mb-3">
+                          <label class="form-label">Gestor Actual</label>
+                          <input type="text" class="form-control" id="gestor_actual" readonly>
+                      </div>
+                      <div class="mb-3">
+                          <label for="nuevo_gestor_id" class="form-label">Nuevo Gestor *</label>
+                          <select class="form-select" id="nuevo_gestor_id" required>
+                              <option value="">Seleccionar gestor...</option>
+                          </select>
+                      </div>
+                  </div>
+                  <div class="modal-footer">
+                      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                          <i class="fas fa-times me-2"></i>Cancelar
+                      </button>
+                      <button type="button" class="btn btn-primary" onclick="guardarCambioGestor()">
+                          <i class="fas fa-save me-2"></i>Guardar Cambio
+                      </button>
+                  </div>
+              </div>
+          </div>
+      </div>
+
+      <script>
+        // Función para ver usuarios banco asignados
+        function verUsuariosBanco(solicitudId) {
+            $('#usuariosBancoContent').html(`
+                <div class="text-center">
+                    <div class="spinner-border text-info" role="status">
+                        <span class="visually-hidden">Cargando...</span>
+                    </div>
+                </div>
+            `);
+            
+            $.ajax({
+                url: 'api/usuarios_banco_solicitudes.php',
+                type: 'GET',
+                data: { solicitud_id: solicitudId },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success && response.data.length > 0) {
+                        let html = '<div class="table-responsive"><table class="table table-hover"><thead><tr><th>Usuario</th><th>Banco</th><th>Email</th><th>Teléfono</th><th>Estado</th></tr></thead><tbody>';
+                        
+                        response.data.forEach(function(usuario) {
+                            const estadoClass = usuario.estado === 'activo' ? 'success' : 'secondary';
+                            const estadoText = usuario.estado === 'activo' ? 'Activo' : 'Inactivo';
+                            
+                            html += `
+                                <tr>
+                                    <td>${usuario.usuario_nombre} ${usuario.usuario_apellido}</td>
+                                    <td>${usuario.banco_nombre || 'N/A'}</td>
+                                    <td>${usuario.usuario_email || 'N/A'}</td>
+                                    <td>${usuario.usuario_telefono || 'N/A'}</td>
+                                    <td><span class="badge bg-${estadoClass}">${estadoText}</span></td>
+                                </tr>
+                            `;
+                        });
+                        
+                        html += '</tbody></table></div>';
+                        $('#usuariosBancoContent').html(html);
+                    } else {
+                        $('#usuariosBancoContent').html('<div class="alert alert-info">No hay usuarios banco asignados a esta solicitud.</div>');
+                    }
+                    
+                    $('#modalUsuariosBanco').modal('show');
+                },
+                error: function() {
+                    $('#usuariosBancoContent').html('<div class="alert alert-danger">Error al cargar los usuarios banco asignados.</div>');
+                    $('#modalUsuariosBanco').modal('show');
+                }
+                          });
+          }
+
+          // Event delegation para links de cambiar gestor
+          $(document).on('click', '.cambiar-gestor-link', function(e) {
+              e.preventDefault();
+              const solicitudId = $(this).data('solicitud-id');
+              const gestorActual = $(this).data('gestor-nombre') || 'Sin asignar';
+              const gestorIdActual = $(this).data('gestor-id');
+              
+              abrirModalCambiarGestor(solicitudId, gestorActual, gestorIdActual);
+          });
+
+          // Función para abrir modal de cambiar gestor
+          function abrirModalCambiarGestor(solicitudId, gestorActual, gestorIdActual) {
+              // Configurar valores del modal
+              $('#gestor_solicitud_id').val(solicitudId);
+              $('#gestor_actual').val(gestorActual || 'Sin asignar');
+              $('#nuevo_gestor_id').val('').html('<option value="">Seleccionar gestor...</option>');
+              
+              // Cargar lista de gestores
+              $.ajax({
+                  url: 'api/solicitudes.php',
+                  type: 'GET',
+                  data: { gestores: true },
+                  dataType: 'json',
+                  success: function(response) {
+                      if (response.success && response.data.length > 0) {
+                          response.data.forEach(function(gestor) {
+                              const selected = (gestor.id == gestorIdActual) ? 'selected' : '';
+                              const option = `<option value="${gestor.id}" ${selected}>${gestor.nombre} ${gestor.apellido}</option>`;
+                              $('#nuevo_gestor_id').append(option);
+                          });
+                      } else {
+                          $('#nuevo_gestor_id').html('<option value="">No hay gestores disponibles</option>');
+                      }
+                      
+                      // Mostrar modal
+                      $('#modalCambiarGestor').modal('show');
+                  },
+                  error: function() {
+                      alert('Error al cargar la lista de gestores');
+                  }
+              });
+          }
+
+          // Función para guardar el cambio de gestor
+          function guardarCambioGestor() {
+              const solicitudId = $('#gestor_solicitud_id').val();
+              const nuevoGestorId = $('#nuevo_gestor_id').val();
+              
+              if (!nuevoGestorId) {
+                  alert('Por favor seleccione un gestor');
+                  return;
+              }
+              
+              // Mostrar indicador de carga
+              const btnGuardar = $('#modalCambiarGestor').find('button[onclick="guardarCambioGestor()"]');
+              const textoOriginal = btnGuardar.html();
+              btnGuardar.prop('disabled', true).html('<i class="fas fa-spinner fa-spin me-2"></i>Guardando...');
+              
+              $.ajax({
+                  url: 'api/solicitudes.php',
+                  type: 'POST',
+                  data: {
+                      action: 'cambiar_gestor',
+                      solicitud_id: solicitudId,
+                      nuevo_gestor_id: nuevoGestorId
+                  },
+                  dataType: 'json',
+                  success: function(response) {
+                      btnGuardar.prop('disabled', false).html(textoOriginal);
+                      
+                      if (response.success) {
+                          $('#modalCambiarGestor').modal('hide');
+                          alert('Gestor actualizado correctamente');
+                          // Recargar la página para actualizar la tabla
+                          location.reload();
+                      } else {
+                          alert('Error: ' + (response.message || 'Error al actualizar el gestor'));
+                      }
+                  },
+                  error: function(xhr) {
+                      btnGuardar.prop('disabled', false).html(textoOriginal);
+                      let mensaje = 'Error de conexión';
+                      try {
+                          const errorResponse = JSON.parse(xhr.responseText);
+                          if (errorResponse.message) {
+                              mensaje = errorResponse.message;
+                          }
+                      } catch (e) {
+                          // Usar mensaje por defecto
+                      }
+                      alert('Error: ' + mensaje);
+                  }
+              });
+          }
+
+        function escapeHtmlText(str) {
+            if (str == null || str === '') return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function destruirDataTableRespuestas(selector) {
+            if (!$.fn.DataTable || !$.fn.DataTable.isDataTable(selector)) return;
+            $(selector).DataTable().destroy();
+        }
+
+        function initDataTableRespuestas(selector) {
+            if (!$.fn.DataTable || !$(selector).length) return;
+            destruirDataTableRespuestas(selector);
+            $(selector).DataTable({
+                language: { url: 'https://cdn.datatables.net/plug-ins/1.13.7/i18n/es-ES.json' },
+                pageLength: 10,
+                lengthMenu: [[10, 25, 50, -1], [10, 25, 50, 'Todos']],
+                order: [[0, 'desc']],
+                scrollX: true,
+                autoWidth: true,
+                deferRender: true,
+                columnDefs: [
+                    { orderable: false, targets: -1 }
+                ]
+            });
+            // Recalcular anchos tras render (evita celdas apiñadas)
+            setTimeout(function() {
+                if ($.fn.DataTable.isDataTable(selector)) {
+                    $(selector).DataTable().columns.adjust();
+                }
+            }, 50);
+        }
+
+        function ajustarDataTableEnModal(modalSelector, tableSelector) {
+            $(modalSelector).one('shown.bs.modal', function() {
+                if ($.fn.DataTable && $.fn.DataTable.isDataTable(tableSelector)) {
+                    $(tableSelector).DataTable().columns.adjust().draw(false);
+                }
+            });
+        }
+
+        function bloqueEncabezadoClienteRespuestas(solicitudId, solicitudCliente) {
+            var sc = solicitudCliente || {};
+            var nombre = escapeHtmlText(sc.nombre_cliente || '');
+            var cedula = escapeHtmlText(sc.cedula || '');
+            var sid = parseInt(solicitudId, 10);
+            if (isNaN(sid)) sid = solicitudId;
+            var partes = [];
+            partes.push('<strong>Cliente:</strong> ' + (nombre || '-'));
+            if (cedula) partes.push('<strong>Cédula:</strong> ' + cedula);
+            partes.push('<strong>Solicitud:</strong> #' + sid);
+            return '<div class="alert alert-light border mb-3"><i class="fas fa-user me-2 text-primary"></i>' + partes.join(' &nbsp;&middot;&nbsp; ') + '</div>';
+        }
+
+        function celdaRespSimple(texto) {
+            var t = (texto == null || texto === '') ? '-' : String(texto);
+            return '<span class="celda-resp-val">' + escapeHtmlText(t) + '</span>';
+        }
+
+        function celdaComentarioGestor(texto) {
+            var t = escapeHtmlText(texto || '');
+            if (!t) return '<span class="text-muted">—</span>';
+            return '<div class="celda-comentario-inner">' + t + '</div>';
+        }
+
+        function tdComentario(htmlInner) {
+            return '<td class="celda-comentario">' + htmlInner + '</td>';
+        }
+
+        function abrirCronologiaSolicitud(solicitudId, nombreCliente) {
+            if (!window.userRoles || !window.userRoles.isAdmin) {
+                return;
+            }
+            nombreCliente = nombreCliente || '';
+            var spanTit = document.createElement('span');
+            spanTit.textContent = ' Cronología — Solicitud #' + solicitudId + (nombreCliente ? ' · ' + nombreCliente : '');
+            $('#modalCronologiaTitulo').empty().append($('<i class="fas fa-history me-2"></i>')).append(spanTit);
+            $('#modalCronologiaBody').html('<div class="text-center py-4"><div class="spinner-border text-secondary" role="status"></div><p class="small text-muted mt-2 mb-0">Cargando eventos…</p></div>');
+            $('#modalCronologiaSolicitud').modal('show');
+            $.ajax({
+                url: 'api/cronologia_solicitud.php',
+                type: 'GET',
+                data: { solicitud_id: solicitudId },
+                dataType: 'json'
+            }).done(function (response) {
+                if (!response.success) {
+                    $('#modalCronologiaBody').html('<div class="alert alert-danger mb-0">' + escapeHtmlText(response.message || 'Error al cargar la cronología.') + '</div>');
+                    return;
+                }
+                var data = response.data || [];
+                if (data.length === 0) {
+                    $('#modalCronologiaBody').html('<p class="text-muted mb-0">No hay eventos registrados para esta solicitud.</p>');
+                    return;
+                }
+                var html = '<p class="text-muted small mb-3">Orden: del más antiguo al más reciente.</p><div class="cronologia-lista">';
+                for (var i = 0; i < data.length; i++) {
+                    var ev = data[i];
+                    var fecha = ev.fecha ? new Date(ev.fecha).toLocaleString('es-PA') : '—';
+                    html += '<div class="border-start border-3 border-secondary ps-3 pb-3 mb-3 ms-1">';
+                    html += '<div class="text-muted small">' + escapeHtmlText(fecha) + '</div>';
+                    html += '<div class="fw-semibold">' + escapeHtmlText(ev.tipo_label || ev.tipo || '') + '</div>';
+                    if (ev.titulo) {
+                        html += '<div class="small text-primary">' + escapeHtmlText(ev.titulo) + '</div>';
+                    }
+                    html += '<div class="small"><i class="fas fa-user me-1 text-muted"></i>' + escapeHtmlText(ev.usuario_nombre || '') + '</div>';
+                    if (ev.detalle) {
+                        html += '<div class="mt-2 small text-break" style="white-space:pre-wrap;">' + escapeHtmlText(ev.detalle) + '</div>';
+                    }
+                    html += '</div>';
+                }
+                html += '</div>';
+                $('#modalCronologiaBody').html(html);
+            }).fail(function () {
+                $('#modalCronologiaBody').html('<div class="alert alert-danger mb-0">Error de conexión al cargar la cronología.</div>');
+            });
+        }
+
+        $(function () {
+            $(document).on('click', '.link-cronologia-solicitud', function (e) {
+                e.preventDefault();
+                if (!window.userRoles || !window.userRoles.isAdmin) return;
+                var id = $(this).data('id');
+                var nom = $(this).attr('data-nombre') || '';
+                if (!id) return;
+                abrirCronologiaSolicitud(id, nom);
+            });
+        });
+
+          // Función para ver respuestas del banco
+        function verRespuestasBanco(solicitudId) {
+            $('#respuestasBancoContent').html(`
+                <div class="text-center">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Cargando...</span>
+                    </div>
+                </div>
+            `);
+            
+            // Obtener las respuestas del banco
+            $.ajax({
+                url: 'api/evaluaciones_banco.php',
+                type: 'GET',
+                data: {
+                    solicitud_id: solicitudId,
+                    usuario_banco_id: <?php echo $_SESSION['user_id']; ?>
+                },
+                success: function(response) {
+                    if (!response.success) {
+                        $('#respuestasBancoContent').html('<div class="alert alert-danger">' + escapeHtmlText(response.message || 'Error al cargar las respuestas.') + '</div>');
+                        $('#modalRespuestasBanco').modal('show');
+                        return;
+                    }
+                    var headerHtml = bloqueEncabezadoClienteRespuestas(solicitudId, response.solicitud_cliente);
+                    var evaluacionSeleccionada = response.evaluacion_seleccionada;
+                    var comentarioSeleccionGlobal = response.comentario_seleccion_propuesta || '';
+                    var criterioSeleccionGlobal = response.criterio_seleccion_propuesta || '';
+                    destruirDataTableRespuestas('#tablaRespuestasBanco');
+                    if (response.data.length > 0) {
+                        let html = '<div class="respuestas-banco-wrap"><table id="tablaRespuestasBanco" class="table table-striped table-hover table-bordered table-respuestas-banco">';
+                        html += '<thead><tr>';
+                        html += '<th>Fecha</th><th>Vehículo</th><th>Decisión</th><th class="celda-comentario">Razón</th><th>Tasa %</th><th>Valor a Financiar</th><th>Abono</th><th>Plazo</th><th>Letra mensual</th><th>Letra quincenal</th><th>Promoción</th><th>Cuantía</th><th class="celda-comentario">Comentarios</th><th class="celda-comentario">Comentario al seleccionar</th><th class="celda-comentario">Motivo reevaluación</th><th>Selección</th>';
+                        html += '</tr></thead><tbody>';
+                        
+                        response.data.forEach(function(evaluacion) {
+                            html += '<tr>';
+                            html += '<td data-order="' + escapeHtmlText(evaluacion.fecha_evaluacion || '') + '">' + celdaRespSimple(new Date(evaluacion.fecha_evaluacion).toLocaleString('es-PA')) + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.vehiculo_marca ? (evaluacion.vehiculo_marca + ' ' + (evaluacion.vehiculo_modelo || '')).trim() : '-') + '</td>';
+                            html += '<td><span class="badge badge-estado estado-revision">' + escapeHtmlText((evaluacion.decision || '').toUpperCase().replace('_', ' ')) + '</span></td>';
+                            html += tdComentario(celdaComentarioGestor(evaluacion.razon));
+                            html += '<td>' + celdaRespSimple(evaluacion.tasa_bancaria != null && evaluacion.tasa_bancaria !== '' ? parseFloat(evaluacion.tasa_bancaria).toLocaleString('es-PA', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + '%' : '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.valor_financiar ? '$' + parseFloat(evaluacion.valor_financiar).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.abono ? '$' + parseFloat(evaluacion.abono).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.plazo ? evaluacion.plazo + ' meses' : '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.letra ? '$' + parseFloat(evaluacion.letra).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.letra_quincenal ? '$' + parseFloat(evaluacion.letra_quincenal).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.promocion || '-') + '</td>';
+                            html += '<td>' + celdaRespSimple(evaluacion.cuantia != null && evaluacion.cuantia !== '' ? '$' + parseFloat(evaluacion.cuantia).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                            html += tdComentario(celdaComentarioGestor(evaluacion.comentarios));
+                            var textoSeleccionFila = '';
+                            if (evaluacionSeleccionada && String(evaluacion.id) === String(evaluacionSeleccionada)) {
+                                textoSeleccionFila = [criterioSeleccionGlobal, comentarioSeleccionGlobal].filter(Boolean).join('\n');
+                            }
+                            html += tdComentario(celdaComentarioGestor(textoSeleccionFila));
+                            html += tdComentario(celdaComentarioGestor(evaluacion.comentario_reevaluacion_solicitada));
+                            html += '<td>';
+                            if (evaluacionSeleccionada && String(evaluacion.id) === String(evaluacionSeleccionada)) {
+                                html += '<span class="badge bg-success"><i class="fas fa-check-circle me-1"></i>Propuesta seleccionada</span>';
+                            } else if (evaluacionSeleccionada) {
+                                html += '<span class="text-muted">—</span>';
+                            } else {
+                                html += '<span class="text-muted"><small>Pendiente de selección</small></span>';
+                            }
+                            html += '</td>';
+                            html += '</tr>';
+                        });
+                        
+                        html += '</tbody></table></div>';
+                        $('#respuestasBancoContent').html(headerHtml + html);
+                        initDataTableRespuestas('#tablaRespuestasBanco');
+                    } else {
+                        $('#respuestasBancoContent').html(headerHtml + '<div class="alert alert-info">No hay respuestas registradas para esta solicitud.</div>');
+                    }
+                    
+                    $('#modalRespuestasBanco').modal('show');
+                    ajustarDataTableEnModal('#modalRespuestasBanco', '#tablaRespuestasBanco');
+                },
+                error: function() {
+                    $('#respuestasBancoContent').html('<div class="alert alert-danger">Error al cargar las respuestas del banco.</div>');
+                    $('#modalRespuestasBanco').modal('show');
+                }
+            });
+        }
+
+        // Función para ver respuestas de todos los bancos (para Admin/Gestor)
+        function verRespuestasBancoAdmin(solicitudId) {
+            $('#respuestasBancoAdminContent').html(`
+                <div class="text-center">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Cargando...</span>
+                    </div>
+                </div>
+            `);
+            
+            // Obtener las respuestas de todos los bancos
+            $.ajax({
+                url: 'api/evaluaciones_banco.php',
+                type: 'GET',
+                data: {
+                    solicitud_id: solicitudId
+                },
+                success: function(response) {
+                    if (!response.success) {
+                        $('#respuestasBancoAdminContent').html('<div class="alert alert-danger">' + escapeHtmlText(response.message || 'Error al cargar las respuestas.') + '</div>');
+                        $('#modalRespuestasBancoAdmin').modal('show');
+                        return;
+                    }
+                    var headerHtml = bloqueEncabezadoClienteRespuestas(solicitudId, response.solicitud_cliente);
+                    destruirDataTableRespuestas('#tablaRespuestasBancoAdmin');
+                    if (response.data.length > 0) {
+                          const evaluacionSeleccionada = response.evaluacion_seleccionada;
+                          const comentarioSeleccionGlobal = response.comentario_seleccion_propuesta || '';
+                          const criterioSeleccionGlobal = response.criterio_seleccion_propuesta || '';
+                          const mostrarAcciones = !evaluacionSeleccionada; // No mostrar acciones si hay una evaluación seleccionada
+                          
+                          let html = '';
+                          if (evaluacionSeleccionada) {
+                              html += '<div class="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">';
+                              html += '<div class="mb-0"><i class="fas fa-lock me-2"></i>Hay una propuesta seleccionada. Los demás bancos no pueden interactuar con esta solicitud.</div>';
+                              html += '<button type="button" class="btn btn-outline-dark btn-sm" onclick="activarNuevamentePropuestas(' + solicitudId + ')">';
+                              html += '<i class="fas fa-unlock me-1"></i>Activar Nuevamente</button></div>';
+                          }
+
+                          html += '<div class="respuestas-banco-wrap"><table id="tablaRespuestasBancoAdmin" class="table table-striped table-hover table-bordered table-respuestas-banco">';
+                          html += '<thead><tr>';
+                          html += '<th>Fecha</th><th>Banco</th><th>Vehículo</th><th>Decisión</th><th class="celda-comentario">Razón</th><th>Tasa %</th><th>Valor a Financiar</th><th>Abono</th><th>Plazo</th><th>Letra mensual</th><th>Letra quincenal</th><th>Promoción</th><th>Cuantía</th><th class="celda-comentario">Comentarios</th><th class="celda-comentario">Comentario al seleccionar</th><th class="celda-comentario">Motivo reevaluación</th>';
+                          if (mostrarAcciones) {
+                              html += '<th>Acciones</th>';
+                          } else {
+                              html += '<th>Selección</th>';
+                          }
+                          html += '</tr></thead><tbody>';
+                          
+                          response.data.forEach(function(evaluacion) {
+                              html += '<tr>';
+                              html += '<td data-order="' + escapeHtmlText(evaluacion.fecha_evaluacion || '') + '">' + celdaRespSimple(new Date(evaluacion.fecha_evaluacion).toLocaleString('es-PA')) + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.nombre ? (evaluacion.nombre + ' ' + (evaluacion.apellido || '')).trim() : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.vehiculo_marca ? (evaluacion.vehiculo_marca + ' ' + (evaluacion.vehiculo_modelo || '')).trim() : '-') + '</td>';
+                              html += '<td><span class="badge badge-estado estado-revision">' + escapeHtmlText((evaluacion.decision || '').toUpperCase().replace('_', ' ')) + '</span></td>';
+                              html += tdComentario(celdaComentarioGestor(evaluacion.razon));
+                              html += '<td>' + celdaRespSimple(evaluacion.tasa_bancaria != null && evaluacion.tasa_bancaria !== '' ? parseFloat(evaluacion.tasa_bancaria).toLocaleString('es-PA', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + '%' : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.valor_financiar ? '$' + parseFloat(evaluacion.valor_financiar).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.abono ? '$' + parseFloat(evaluacion.abono).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.plazo ? evaluacion.plazo + ' meses' : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.letra ? '$' + parseFloat(evaluacion.letra).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.letra_quincenal ? '$' + parseFloat(evaluacion.letra_quincenal).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.promocion || '-') + '</td>';
+                              html += '<td>' + celdaRespSimple(evaluacion.cuantia != null && evaluacion.cuantia !== '' ? '$' + parseFloat(evaluacion.cuantia).toLocaleString('es-PA', {minimumFractionDigits: 2}) : '-') + '</td>';
+                              html += tdComentario(celdaComentarioGestor(evaluacion.comentarios));
+                              var textoSel = '';
+                              if (evaluacionSeleccionada && String(evaluacion.id) === String(evaluacionSeleccionada)) {
+                                  textoSel = [criterioSeleccionGlobal, comentarioSeleccionGlobal].filter(Boolean).join('\n');
+                              }
+                              html += tdComentario(celdaComentarioGestor(textoSel));
+                              html += tdComentario(celdaComentarioGestor(evaluacion.comentario_reevaluacion_solicitada));
+                              if (mostrarAcciones) {
+                                  html += '<td><div class="btn-group-vertical btn-group-sm">';
+                                  html += '<button class="btn btn-success btn-sm mb-1" onclick="seleccionarPropuesta(' + evaluacion.id + ', ' + solicitudId + ', \'' + evaluacion.usuario_banco_id + '\')" title="Seleccionar Propuesta"><i class="fas fa-check me-1"></i>Seleccionar</button>';
+                                  html += '<button class="btn btn-warning btn-sm" onclick="solicitarReevaluacion(' + evaluacion.id + ', ' + solicitudId + ', \'' + evaluacion.usuario_banco_id + '\')" title="Solicitar Reevaluación"><i class="fas fa-redo me-1"></i>Reevaluar</button>';
+                                  html += '</div></td>';
+                              } else {
+                                  html += '<td>';
+                                  if (evaluacion.id == evaluacionSeleccionada) {
+                                      html += '<span class="badge bg-success"><i class="fas fa-check-circle me-1"></i>Propuesta seleccionada</span>';
+                                  } else {
+                                      html += '<span class="text-muted">—</span>';
+                                  }
+                                  html += '</td>';
+                              }
+                              html += '</tr>';
+                          });
+                          
+                          html += '</tbody></table></div>';
+                          $('#respuestasBancoAdminContent').html(headerHtml + html);
+                          initDataTableRespuestas('#tablaRespuestasBancoAdmin');
+                    } else {
+                        $('#respuestasBancoAdminContent').html(headerHtml + '<div class="alert alert-info">No hay respuestas registradas para esta solicitud.</div>');
+                    }
+                    
+                    $('#modalRespuestasBancoAdmin').modal('show');
+                    ajustarDataTableEnModal('#modalRespuestasBancoAdmin', '#tablaRespuestasBancoAdmin');
+                },
+                error: function() {
+                    $('#respuestasBancoAdminContent').html('<div class="alert alert-danger">Error al cargar las respuestas del banco.</div>');
+                    $('#modalRespuestasBancoAdmin').modal('show');
+                }
+            });
+        }
+
+        // Función para seleccionar una propuesta
+        function seleccionarPropuesta(evaluacionId, solicitudId, usuarioBancoId) {
+            $('#seleccionPropuesta_id').val(evaluacionId);
+            $('#seleccionPropuesta_solicitud_id').val(solicitudId);
+            $('#seleccionPropuesta_usuario_banco_id').val(usuarioBancoId);
+            $('#criterioSeleccion').val('');
+            $('#comentarioSeleccion').val('');
+            $('#modalSeleccionPropuesta').modal('show');
+        }
+
+        // Función para solicitar reevaluación
+        function solicitarReevaluacion(evaluacionId, solicitudId, usuarioBancoId) {
+            $('#reevaluacion_id').val(evaluacionId);
+            $('#reevaluacion_solicitud_id').val(solicitudId);
+            $('#reevaluacion_usuario_banco_id').val(usuarioBancoId);
+            $('#comentarioReevaluacion').val('');
+            $('#modalSolicitarReevaluacion').modal('show');
+        }
+
+        // Reactivar bancos: limpia la propuesta seleccionada
+        function activarNuevamentePropuestas(solicitudId) {
+            if (!confirm('¿Activar nuevamente esta solicitud?\n\nSe quitará la propuesta seleccionada y todos los bancos habilitados podrán volver a interactuar (p. ej. si el cliente cambia de banco o hay que ajustar condiciones).')) {
+                return;
+            }
+
+            $.ajax({
+                url: 'api/evaluaciones_banco.php',
+                type: 'POST',
+                data: {
+                    action: 'activar_nuevamente',
+                    solicitud_id: solicitudId
+                },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        alert(response.message);
+                        verRespuestasBancoAdmin(solicitudId);
+                    } else {
+                        alert('Error: ' + (response.message || 'No se pudo activar nuevamente'));
+                    }
+                },
+                error: function() {
+                    alert('Error al activar nuevamente la solicitud');
+                }
+            });
+        }
+
+        // Función para procesar la selección de propuesta
+        function procesarSeleccionPropuesta() {
+            const evaluacionId = $('#seleccionPropuesta_id').val();
+            const solicitudId = $('#seleccionPropuesta_solicitud_id').val();
+            const criterio = ($('#criterioSeleccion').val() || '').trim();
+            const comentario = $('#comentarioSeleccion').val();
+
+            if (!criterio) {
+                alert('Por favor seleccione el criterio de aceptación');
+                return;
+            }
+
+            if (!comentario.trim()) {
+                alert('Por favor ingrese un comentario');
+                return;
+            }
+
+            $.ajax({
+                url: 'api/evaluaciones_banco.php',
+                type: 'POST',
+                data: {
+                    action: 'seleccionar_propuesta',
+                    evaluacion_id: evaluacionId,
+                    solicitud_id: solicitudId,
+                    criterio: criterio,
+                    comentario: comentario
+                },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        alert(response.message);
+                        $('#modalSeleccionPropuesta').modal('hide');
+                        // Recargar modal de respuestas
+                        verRespuestasBancoAdmin(solicitudId);
+                    } else {
+                        alert('Error: ' + response.message);
+                    }
+                },
+                error: function() {
+                    alert('Error al procesar la selección de la propuesta');
+                }
+            });
+        }
+
+        // Función para procesar la solicitud de reevaluación
+        function procesarReevaluacion() {
+            const evaluacionId = $('#reevaluacion_id').val();
+            const solicitudId = $('#reevaluacion_solicitud_id').val();
+            const comentario = $('#comentarioReevaluacion').val();
+
+            if (!comentario.trim()) {
+                alert('Por favor ingrese un comentario');
+                return;
+            }
+
+            $.ajax({
+                url: 'api/evaluaciones_banco.php',
+                type: 'POST',
+                data: {
+                    action: 'solicitar_reevaluacion',
+                    evaluacion_id: evaluacionId,
+                    solicitud_id: solicitudId,
+                    comentario: comentario
+                },
+                dataType: 'json',
+                success: function(response) {
+                    if (response.success) {
+                        alert(response.message);
+                        $('#modalSolicitarReevaluacion').modal('hide');
+                        // Recargar modal de respuestas
+                        verRespuestasBancoAdmin(solicitudId);
+                    } else {
+                        alert('Error: ' + response.message);
+                    }
+                },
+                error: function() {
+                    alert('Error al procesar la solicitud de reevaluación');
+                }
+            });
+        }
+    </script>
+
+    <!-- Modal cronología de solicitud -->
+    <div class="modal fade" id="modalCronologiaSolicitud" tabindex="-1" aria-labelledby="modalCronologiaTitulo" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title d-flex align-items-center" id="modalCronologiaTitulo">
+                        <i class="fas fa-history me-2"></i><span>Cronología</span>
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cerrar"></button>
+                </div>
+                <div class="modal-body" id="modalCronologiaBody"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para ver mis respuestas (usuario banco) — mismo criterio visual que admin/gestor -->
+    <div class="modal fade modal-respuestas-bancos" id="modalRespuestasBanco" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-clipboard-list me-2"></i>Mis respuestas en esta solicitud
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="respuestasBancoContent">
+                        <div class="text-center">
+                            <div class="spinner-border text-warning" role="status">
+                                <span class="visually-hidden">Cargando...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para ver Respuestas del Banco (Admin/Gestor) -->
+    <div class="modal fade modal-respuestas-bancos" id="modalRespuestasBancoAdmin" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-clipboard-list me-2"></i>Respuestas de los Bancos
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="respuestasBancoAdminContent">
+                        <div class="text-center">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Cargando...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Agregar / Editar Evento (Cita y Firma) — se abre sobre Editar Solicitud -->
+    <div class="modal fade" id="modalEventoCitaFirma" tabindex="-1" aria-labelledby="modalEventoCitaFirmaLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title" id="modalEventoCitaFirmaLabel">
+                        <i class="fas fa-calendar-plus me-2"></i><span id="modalEventoCitaFirmaTitulo">Agregar Evento</span>
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cerrar"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="evento_cita_id" value="">
+                    <div class="mb-3">
+                        <label for="evento_nombre" class="form-label">Nombre del Evento *</label>
+                        <input type="text" class="form-control" id="evento_nombre" maxlength="255" placeholder="Ej. Firma de documentos, Entrega de póliza...">
+                    </div>
+                    <div class="mb-3">
+                        <label for="evento_fecha" class="form-label">Fecha del evento *</label>
+                        <input type="date" class="form-control" id="evento_fecha">
+                    </div>
+                    <div class="mb-0">
+                        <label for="evento_comentario" class="form-label">Comentario</label>
+                        <textarea class="form-control" id="evento_comentario" rows="3" placeholder="Detalle u observaciones del evento..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary" id="btnGuardarEventoCitaFirma" onclick="guardarEventoCitaFirma()">
+                        <i class="fas fa-save me-2"></i>Guardar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para Seleccionar Propuesta -->
+    <div class="modal fade" id="modalSeleccionPropuesta" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-success text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-check-circle me-2"></i>Seleccionar Propuesta
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="seleccionPropuesta_id">
+                    <input type="hidden" id="seleccionPropuesta_solicitud_id">
+                    <input type="hidden" id="seleccionPropuesta_usuario_banco_id">
+
+                    <div class="mb-3">
+                        <label for="criterioSeleccion" class="form-label">Criterio de aceptación *</label>
+                        <select class="form-select" id="criterioSeleccion" required>
+                            <option value="">Seleccione un criterio…</option>
+                            <option value="ABONO MINIMO">ABONO MINIMO</option>
+                            <option value="TASAS">TASAS</option>
+                            <option value="PLAZOS">PLAZOS</option>
+                            <option value="PRECIO DE VENTA">PRECIO DE VENTA</option>
+                            <option value="Monto Mínimo a Financiar">Monto Mínimo a Financiar</option>
+                            <option value="APLICAN AUTOS DESDE (Año)">APLICAN AUTOS DESDE (Año)</option>
+                            <option value="SALARIO">SALARIO</option>
+                            <option value="SCORE">SCORE</option>
+                            <option value="NIVEL DE ENDEUDAMIENTO (%)">NIVEL DE ENDEUDAMIENTO (%)</option>
+                            <option value="Estabilidad laboral">Estabilidad laboral</option>
+                            <option value="Edad mínima">Edad mínima</option>
+                            <option value="Kilometraje">Kilometraje</option>
+                            <option value="AVALUO">AVALUO</option>
+                            <option value="BONO PROMOCION">BONO PROMOCION</option>
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="comentarioSeleccion" class="form-label">Comentario *</label>
+                        <textarea class="form-control" id="comentarioSeleccion" rows="4" required placeholder="Ingrese un comentario sobre la selección de esta propuesta..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-success" onclick="procesarSeleccionPropuesta()">
+                        <i class="fas fa-check me-2"></i>Confirmar Selección
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para Solicitar Reevaluación -->
+    <div class="modal fade" id="modalSolicitarReevaluacion" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-warning text-dark">
+                    <h5 class="modal-title">
+                        <i class="fas fa-redo me-2"></i>Solicitar Reevaluación
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="reevaluacion_id">
+                    <input type="hidden" id="reevaluacion_solicitud_id">
+                    <input type="hidden" id="reevaluacion_usuario_banco_id">
+                    
+                    <div class="mb-3">
+                        <label for="comentarioReevaluacion" class="form-label">Comentario *</label>
+                        <textarea class="form-control" id="comentarioReevaluacion" rows="4" required placeholder="Ingrese el motivo por el cual solicita la reevaluación..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-warning" onclick="procesarReevaluacion()">
+                        <i class="fas fa-redo me-2"></i>Solicitar Reevaluación
+                    </button>
+                </div>
+            </div>
+        </div>
+          </div>
+  
+      <!-- Modal para Apartar Vehículo -->
+      <div class="modal fade" id="modalApartarVehiculo" tabindex="-1">
+          <div class="modal-dialog">
+              <div class="modal-content">
+                  <div class="modal-header bg-warning text-dark">
+                      <h5 class="modal-title">
+                          <i class="fas fa-bookmark me-2"></i>Apartar Vehículo
+                      </h5>
+                      <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                  </div>
+                  <div class="modal-body">
+                      <input type="hidden" id="vehiculo_index_apartar">
+                      <div class="alert alert-warning">
+                          <i class="fas fa-exclamation-triangle me-2"></i>
+                          ¿Está seguro de apartar el vehículo seleccionado?
+                      </div>
+                      <div class="mb-3">
+                          <strong>Vehículo:</strong> <span id="vehiculo_info_apartar"></span>
+                      </div>
+                  </div>
+                  <div class="modal-footer">
+                      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                          <i class="fas fa-times me-2"></i>Cancelar
+                      </button>
+                      <button type="button" class="btn btn-warning" data-bs-dismiss="modal">
+                          <i class="fas fa-check me-2"></i>Confirmar
+                      </button>
+                  </div>
+              </div>
+          </div>
+      </div>
+  
+      <script src="https://cdn.jsdelivr.net/npm/select2@4.0.13/dist/js/select2.full.min.js"></script>
+      <script src="js/solicitudes.js?v=<?php echo file_exists(__DIR__ . '/js/solicitudes.js') ? filemtime(__DIR__ . '/js/solicitudes.js') : time(); ?>"></script>
+      <script src="js/adjuntos.js?v=<?php echo file_exists(__DIR__ . '/js/adjuntos.js') ? filemtime(__DIR__ . '/js/adjuntos.js') : time(); ?>"></script>
+      <?php include __DIR__ . '/includes/chatbot_widget.php'; ?>
+  </body>
+  </html>

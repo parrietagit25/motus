@@ -1,0 +1,67 @@
+# Imagen base de PHP con Apache, fijada por digest (8.3.36 corrige GHSA-w8hw-w9fx-j79w y GHSA-6wmf-4rv5-p3rp)
+FROM php:8.3.36-apache@sha256:d89e8b3d2033c3179dcd9999d913670eb12a07410a95e60205c64e7d0fac7aef
+
+# Instalar extensiones básicas de PHP (libonig-dev = oniguruma para mbstring)
+RUN apt-get update && apt-get install -y \
+    libzip-dev \
+    zip \
+    unzip \
+    libpng-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
+    libxml2-dev \
+    libonig-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) \
+        pdo_mysql \
+        mysqli \
+        zip \
+        gd \
+        mbstring
+
+# Habilitar mod_rewrite y encabezados de seguridad
+RUN a2enmod rewrite headers expires deflate
+
+# Permitir subida de archivos grandes (evitar 403 por límite de Apache)
+COPY docker/apache-uploads.conf /etc/apache2/conf-enabled/uploads.conf
+COPY docker/apache-seguridad.conf /etc/apache2/conf-enabled/seguridad.conf
+COPY docker/php-seguridad.ini /usr/local/etc/php/conf.d/zz-seguridad.ini
+
+# Entrypoint: composer en bind mount (ver docker/apache-entrypoint.sh)
+COPY docker/apache-entrypoint.sh /usr/local/bin/apache-entrypoint.sh
+RUN chmod +x /usr/local/bin/apache-entrypoint.sh
+
+# Configurar Apache para permitir .htaccess
+RUN echo '<Directory /var/www/html>' >> /etc/apache2/apache2.conf \
+    && echo '    AllowOverride All' >> /etc/apache2/apache2.conf \
+    && echo '</Directory>' >> /etc/apache2/apache2.conf
+
+# Establecer directorio de trabajo
+WORKDIR /var/www/html
+
+# Copiar archivos de la aplicación
+COPY . /var/www/html/
+
+# Composer (dependencias PHP: Resend, Dompdf, etc.)
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+# Solo composer.lock: un fallo aquí debe detener el build, no actualizar dependencias.
+RUN composer install --no-dev --no-interaction --optimize-autoloader --working-dir=/var/www/html
+
+# Establecer permisos correctos
+RUN mkdir -p /var/www/html/adjuntos /var/www/html/logs \
+    && chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html \
+    && chmod -R 777 /var/www/html/adjuntos
+
+# Configurar PHP
+RUN echo "upload_max_filesize = 50M" >> /usr/local/etc/php/conf.d/uploads.ini \
+    && echo "post_max_size = 50M" >> /usr/local/etc/php/conf.d/uploads.ini \
+    && echo "max_execution_time = 300" >> /usr/local/etc/php/conf.d/uploads.ini \
+    && echo "memory_limit = 256M" >> /usr/local/etc/php/conf.d/uploads.ini
+
+# Exponer puerto 80
+EXPOSE 80
+
+ENTRYPOINT ["/usr/local/bin/apache-entrypoint.sh"]
+# Comando por defecto
+CMD ["apache2-foreground"]

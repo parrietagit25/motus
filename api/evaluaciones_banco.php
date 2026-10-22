@@ -1,0 +1,942 @@
+<?php
+session_start();
+
+// Suprimir warnings de deprecación que pueden romper el JSON / binarios
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_STRICT);
+ini_set('display_errors', 0);
+
+// Verificar si el usuario está logueado
+if (!isset($_SESSION['user_id'])) {
+    http_response_code(401);
+    header('Content-Type: application/json');
+    echo json_encode(['success' => false, 'message' => 'No autorizado']);
+    exit();
+}
+
+require_once '../config/database.php';
+require_once '../includes/banco_scope_helper.php';
+
+$exportarXlsxMisPropuestas = ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
+    && !empty($_GET['mis_propuestas'])
+    && (string) $_GET['mis_propuestas'] === '1'
+    && !empty($_GET['exportar_xlsx'])
+    && (string) $_GET['exportar_xlsx'] === '1';
+
+if (!$exportarXlsxMisPropuestas) {
+    header('Content-Type: application/json');
+}
+
+function evaluaciones_tiene_letra_quincenal(PDO $pdo): bool
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+    try {
+        $db = $pdo->query('SELECT DATABASE()')->fetchColumn();
+        $st = $pdo->prepare("
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'evaluaciones_banco' AND COLUMN_NAME = 'letra_quincenal'
+        ");
+        $st->execute([$db]);
+        $cache = ((int) $st->fetchColumn()) > 0;
+    } catch (Throwable $e) {
+        $cache = false;
+    }
+    return $cache;
+}
+
+function evaluaciones_tiene_cuantia(PDO $pdo): bool
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+    try {
+        $db = $pdo->query('SELECT DATABASE()')->fetchColumn();
+        $st = $pdo->prepare("
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'evaluaciones_banco' AND COLUMN_NAME = 'cuantia'
+        ");
+        $st->execute([$db]);
+        $cache = ((int) $st->fetchColumn()) > 0;
+    } catch (Throwable $e) {
+        $cache = false;
+    }
+    return $cache;
+}
+
+function evaluaciones_tiene_razon(PDO $pdo): bool
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+    try {
+        $db = $pdo->query('SELECT DATABASE()')->fetchColumn();
+        $st = $pdo->prepare("
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'evaluaciones_banco' AND COLUMN_NAME = 'razon'
+        ");
+        $st->execute([$db]);
+        $cache = ((int) $st->fetchColumn()) > 0;
+    } catch (Throwable $e) {
+        $cache = false;
+    }
+    return $cache;
+}
+
+$method = $_SERVER['REQUEST_METHOD'];
+
+switch ($method) {
+    case 'GET':
+        if (!empty($_GET['mis_propuestas']) && $_GET['mis_propuestas'] === '1') {
+            if (!empty($_GET['exportar_xlsx']) && (string) $_GET['exportar_xlsx'] === '1') {
+                exportarMisPropuestasBancoXlsx();
+            } else {
+                listarMisPropuestasBanco();
+            }
+        } elseif (isset($_GET['solicitud_id'])) {
+            $usuarioBancoId = isset($_GET['usuario_banco_id']) ? $_GET['usuario_banco_id'] : null;
+            obtenerEvaluaciones($_GET['solicitud_id'], $usuarioBancoId);
+        } else {
+            echo json_encode(['success' => false, 'message' => 'ID de solicitud requerido']);
+        }
+        break;
+        
+    case 'POST':
+        if (isset($_POST['action'])) {
+            switch ($_POST['action']) {
+                case 'seleccionar_propuesta':
+                    seleccionarPropuesta();
+                    break;
+                case 'activar_nuevamente':
+                    activarNuevamentePropuestas();
+                    break;
+                case 'solicitar_reevaluacion':
+                    solicitarReevaluacion();
+                    break;
+                default:
+                    guardarEvaluacion();
+                    break;
+            }
+        } else {
+            guardarEvaluacion();
+        }
+        break;
+        
+    default:
+        http_response_code(405);
+        echo json_encode(['success' => false, 'message' => 'Método no permitido']);
+        break;
+}
+
+/**
+ * Datos de propuestas del usuario banco (o toda la entidad si ROLE_ADMIN_BANCO).
+ *
+ * @return array{ok:bool,message?:string,http?:int,es_admin_banco?:bool,data?:array<int,array>}
+ */
+function obtenerDatosMisPropuestasBanco(): array {
+    global $pdo;
+
+    $roles = $_SESSION['user_roles'] ?? [];
+    if (!motus_es_vista_banco($roles)) {
+        return ['ok' => false, 'http' => 403, 'message' => 'Solo usuarios banco pueden ver esta lista'];
+    }
+
+    $uid = (int) $_SESSION['user_id'];
+    $esAdminBanco = motus_es_admin_banco($roles);
+
+    try {
+        if ($esAdminBanco) {
+            $bancoId = motus_obtener_banco_id_usuario($pdo, $uid);
+            if (!$bancoId) {
+                return ['ok' => false, 'http' => 403, 'message' => 'Admin banco sin entidad bancaria asignada'];
+            }
+            $sql = "
+                SELECT
+                    e.*,
+                    s.id AS solicitud_id,
+                    s.nombre_cliente,
+                    s.cedula,
+                    s.estado AS solicitud_estado,
+                    s.evaluacion_seleccionada,
+                    (s.evaluacion_seleccionada = e.id) AS es_propuesta_seleccionada,
+                    v.marca AS vehiculo_marca,
+                    v.modelo AS vehiculo_modelo,
+                    v.anio AS vehiculo_anio,
+                    u.nombre AS analista_nombre,
+                    u.apellido AS analista_apellido
+                FROM evaluaciones_banco e
+                INNER JOIN usuarios_banco_solicitudes ubs ON e.usuario_banco_id = ubs.id
+                INNER JOIN usuarios u ON u.id = ubs.usuario_banco_id
+                INNER JOIN solicitudes_credito s ON e.solicitud_id = s.id
+                LEFT JOIN vehiculos_solicitud v ON e.vehiculo_id = v.id
+                WHERE u.banco_id = ?
+                ORDER BY e.fecha_evaluacion DESC
+            ";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$bancoId]);
+        } else {
+            $sql = "
+                SELECT
+                    e.*,
+                    s.id AS solicitud_id,
+                    s.nombre_cliente,
+                    s.cedula,
+                    s.estado AS solicitud_estado,
+                    s.evaluacion_seleccionada,
+                    (s.evaluacion_seleccionada = e.id) AS es_propuesta_seleccionada,
+                    v.marca AS vehiculo_marca,
+                    v.modelo AS vehiculo_modelo,
+                    v.anio AS vehiculo_anio
+                FROM evaluaciones_banco e
+                INNER JOIN usuarios_banco_solicitudes ubs ON e.usuario_banco_id = ubs.id
+                INNER JOIN solicitudes_credito s ON e.solicitud_id = s.id
+                LEFT JOIN vehiculos_solicitud v ON e.vehiculo_id = v.id
+                WHERE ubs.usuario_banco_id = ?
+                ORDER BY e.fecha_evaluacion DESC
+            ";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$uid]);
+        }
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($rows as &$r) {
+            $r['es_propuesta_seleccionada'] = !empty($r['es_propuesta_seleccionada']);
+        }
+        unset($r);
+
+        return [
+            'ok' => true,
+            'es_admin_banco' => $esAdminBanco,
+            'data' => $rows,
+        ];
+    } catch (Throwable $e) {
+        error_log('obtenerDatosMisPropuestasBanco: ' . $e->getMessage());
+        return ['ok' => false, 'http' => 500, 'message' => 'Error al cargar propuestas'];
+    }
+}
+
+/**
+ * Lista evaluaciones (propuestas) del usuario banco logueado,
+ * o de toda la entidad si es ROLE_ADMIN_BANCO.
+ */
+function listarMisPropuestasBanco(): void {
+    $result = obtenerDatosMisPropuestasBanco();
+    if (empty($result['ok'])) {
+        http_response_code((int) ($result['http'] ?? 500));
+        echo json_encode(['success' => false, 'message' => $result['message'] ?? 'Error']);
+        return;
+    }
+
+    echo json_encode([
+        'success' => true,
+        'es_admin_banco' => !empty($result['es_admin_banco']),
+        'data' => $result['data'] ?? [],
+    ]);
+}
+
+function exportarMisPropuestasBancoXlsx(): void {
+    require_once __DIR__ . '/../includes/xlsx_export.php';
+
+    $result = obtenerDatosMisPropuestasBanco();
+    if (empty($result['ok'])) {
+        http_response_code((int) ($result['http'] ?? 500));
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => $result['message'] ?? 'Error']);
+        return;
+    }
+
+    $esAdminBanco = !empty($result['es_admin_banco']);
+    $headers = [
+        'Fecha',
+        'Solicitud',
+        'Cliente',
+        'Cédula',
+    ];
+    if ($esAdminBanco) {
+        $headers[] = 'Encargado';
+    }
+    $headers = array_merge($headers, [
+        'Estado solicitud',
+        'Vehículo',
+        'Decisión',
+        'Razón',
+        'Tasa %',
+        'Valor a financiar',
+        'Abono',
+        'Plazo (meses)',
+        'Letra mensual',
+        'Letra quincenal',
+        'Promoción',
+        'Cuantía',
+        'Comentarios',
+        'Seleccionada',
+    ]);
+
+    $rows = [];
+    foreach ($result['data'] as $r) {
+        $vehiculo = trim(implode(' ', array_filter([
+            $r['vehiculo_marca'] ?? '',
+            $r['vehiculo_modelo'] ?? '',
+            isset($r['vehiculo_anio']) && $r['vehiculo_anio'] !== '' && $r['vehiculo_anio'] !== null
+                ? (string) $r['vehiculo_anio']
+                : '',
+        ], static function ($v) {
+            return $v !== null && $v !== '';
+        })));
+        $decision = strtoupper(str_replace('_', ' ', (string) ($r['decision'] ?? '')));
+        $row = [
+            (string) ($r['fecha_evaluacion'] ?? ''),
+            (int) ($r['solicitud_id'] ?? 0),
+            (string) ($r['nombre_cliente'] ?? ''),
+            (string) ($r['cedula'] ?? ''),
+        ];
+        if ($esAdminBanco) {
+            $row[] = trim(((string) ($r['analista_nombre'] ?? '')) . ' ' . ((string) ($r['analista_apellido'] ?? '')));
+        }
+        $row = array_merge($row, [
+            (string) ($r['solicitud_estado'] ?? ''),
+            $vehiculo !== '' ? $vehiculo : '-',
+            $decision !== '' ? $decision : '-',
+            (string) ($r['razon'] ?? ''),
+            $r['tasa_bancaria'] !== null && $r['tasa_bancaria'] !== '' ? (float) $r['tasa_bancaria'] : '',
+            $r['valor_financiar'] !== null && $r['valor_financiar'] !== '' ? (float) $r['valor_financiar'] : '',
+            $r['abono'] !== null && $r['abono'] !== '' ? (float) $r['abono'] : '',
+            $r['plazo'] !== null && $r['plazo'] !== '' ? (int) $r['plazo'] : '',
+            $r['letra'] !== null && $r['letra'] !== '' ? (float) $r['letra'] : '',
+            isset($r['letra_quincenal']) && $r['letra_quincenal'] !== null && $r['letra_quincenal'] !== ''
+                ? (float) $r['letra_quincenal']
+                : '',
+            (string) ($r['promocion'] ?? ''),
+            $r['cuantia'] !== null && $r['cuantia'] !== '' ? (float) $r['cuantia'] : '',
+            (string) ($r['comentarios'] ?? ''),
+            !empty($r['es_propuesta_seleccionada']) ? 'Sí' : 'No',
+        ]);
+        $rows[] = $row;
+    }
+
+    $fileName = $esAdminBanco
+        ? ('propuestas_banco_' . date('Ymd_His') . '.xlsx')
+        : ('mis_propuestas_' . date('Ymd_His') . '.xlsx');
+    $sheetName = $esAdminBanco ? 'Propuestas banco' : 'Mis propuestas';
+
+    motus_output_xlsx_download($fileName, $sheetName, $headers, $rows);
+    exit;
+}
+
+function obtenerEvaluaciones($solicitudId, $usuarioBancoId = null) {
+      global $pdo;
+      
+      try {
+          asegurarColumnaCriterioSeleccionPropuesta($pdo);
+          // Primero obtener información sobre la evaluación seleccionada
+          $stmt = $pdo->prepare("
+              SELECT s.evaluacion_seleccionada,
+                     s.nombre_cliente,
+                     s.cedula,
+                     s.comentario_seleccion_propuesta,
+                     s.criterio_seleccion_propuesta,
+                     (SELECT ubs_sel.usuario_banco_id
+                        FROM evaluaciones_banco eb2
+                        INNER JOIN usuarios_banco_solicitudes ubs_sel ON ubs_sel.id = eb2.usuario_banco_id
+                       WHERE eb2.id = s.evaluacion_seleccionada
+                       LIMIT 1) AS usuario_banco_id_seleccionado
+              FROM solicitudes_credito s
+              WHERE s.id = ?
+          ");
+          $stmt->execute([$solicitudId]);
+          $solicitud = $stmt->fetch();
+
+          if (!$solicitud) {
+              echo json_encode(['success' => false, 'message' => 'Solicitud no encontrada']);
+              return;
+          }
+
+          $evaluacionSeleccionada = $solicitud['evaluacion_seleccionada'] ?? null;
+          $usuarioBancoIdSeleccionado = $solicitud['usuario_banco_id_seleccionado'] ?? null;
+          
+          $sql = "
+              SELECT e.*, 
+                     u.nombre, u.apellido,
+                     v.marca as vehiculo_marca, v.modelo as vehiculo_modelo, v.anio as vehiculo_anio
+              FROM evaluaciones_banco e
+              LEFT JOIN usuarios_banco_solicitudes ubs ON e.usuario_banco_id = ubs.id
+              LEFT JOIN usuarios u ON ubs.usuario_banco_id = u.id
+              LEFT JOIN vehiculos_solicitud v ON e.vehiculo_id = v.id
+              WHERE e.solicitud_id = ?
+          ";
+          
+          $params = [$solicitudId];
+          
+          if ($usuarioBancoId) {
+              $sql .= " AND ubs.usuario_banco_id = ?";
+              $params[] = $usuarioBancoId;
+          }
+          
+          $sql .= " ORDER BY e.fecha_evaluacion DESC";
+          
+          $stmt = $pdo->prepare($sql);
+          $stmt->execute($params);
+          $evaluaciones = $stmt->fetchAll();
+          
+          echo json_encode([
+              'success' => true,
+              'data' => $evaluaciones,
+              'evaluacion_seleccionada' => $evaluacionSeleccionada,
+              'usuario_banco_id_seleccionado' => $usuarioBancoIdSeleccionado,
+              'comentario_seleccion_propuesta' => $solicitud['comentario_seleccion_propuesta'] ?? '',
+              'criterio_seleccion_propuesta' => $solicitud['criterio_seleccion_propuesta'] ?? '',
+              'solicitud_cliente' => [
+                  'nombre_cliente' => $solicitud['nombre_cliente'] ?? '',
+                  'cedula' => $solicitud['cedula'] ?? '',
+              ],
+          ]);
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error de base de datos']);
+    }
+}
+
+function guardarEvaluacion() {
+    global $pdo;
+    
+    try {
+        // Validar campos requeridos
+        if (empty($_POST['solicitud_id']) || empty($_POST['decision'])) {
+            echo json_encode(['success' => false, 'message' => 'Solicitud ID y decisión son requeridos']);
+            return;
+        }
+        
+        $solicitudId = $_POST['solicitud_id'];
+        $decision = $_POST['decision'];
+
+        $tasaRaw = isset($_POST['tasa_bancaria']) ? trim((string) $_POST['tasa_bancaria']) : '';
+        if ($tasaRaw === '' || !is_numeric($tasaRaw)) {
+            echo json_encode(['success' => false, 'message' => 'La tasa bancaria (%) es obligatoria y debe ser un número']);
+            return;
+        }
+        $tasaBancaria = round((float) $tasaRaw, 2);
+        if ($tasaBancaria < 0 || $tasaBancaria > 100) {
+            echo json_encode(['success' => false, 'message' => 'La tasa bancaria debe estar entre 0 y 100']);
+            return;
+        }
+        
+        // Verificar que el usuario es banco
+        if (!isset($_SESSION['user_roles']) || !in_array('ROLE_BANCO', $_SESSION['user_roles'])) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'No tiene permisos para evaluar solicitudes']);
+            return;
+        }
+        
+        // Verificar que el usuario está asignado a esta solicitud
+        $stmt = $pdo->prepare("
+            SELECT id FROM usuarios_banco_solicitudes 
+            WHERE solicitud_id = ? AND usuario_banco_id = ? AND estado = 'activo'
+            LIMIT 1
+        ");
+        $stmt->execute([$solicitudId, $_SESSION['user_id']]);
+        $asignacion = $stmt->fetch();
+        
+        if (!$asignacion) {
+            echo json_encode(['success' => false, 'message' => 'No está asignado a esta solicitud']);
+            return;
+        }
+
+        $stmtEstado = $pdo->prepare('SELECT estado FROM solicitudes_credito WHERE id = ? LIMIT 1');
+        $stmtEstado->execute([$solicitudId]);
+        $estadoActual = (string) ($stmtEstado->fetchColumn() ?: '');
+        $estadosSinDecisionBanco = ['Rechazada', 'Completada', 'Desistimiento'];
+        if (in_array($estadoActual, $estadosSinDecisionBanco, true)) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'No se puede registrar decisión cuando la solicitud está en estado "' . $estadoActual . '".',
+            ]);
+            return;
+        }
+
+        // Si el gestor ya seleccionó una propuesta de otra entidad, no procesar esta decisión.
+        $stmt = $pdo->prepare("
+            SELECT s.evaluacion_seleccionada,
+                   ubs.usuario_banco_id AS usuario_seleccionado_id,
+                   TRIM(CONCAT(COALESCE(u.nombre, ''), ' ', COALESCE(u.apellido, ''))) AS agente_seleccionado,
+                   b.nombre AS entidad_seleccionada
+            FROM solicitudes_credito s
+            LEFT JOIN evaluaciones_banco e ON e.id = s.evaluacion_seleccionada
+            LEFT JOIN usuarios_banco_solicitudes ubs ON ubs.id = e.usuario_banco_id
+            LEFT JOIN usuarios u ON u.id = ubs.usuario_banco_id
+            LEFT JOIN bancos b ON b.id = u.banco_id
+            WHERE s.id = ?
+            LIMIT 1
+        ");
+        $stmt->execute([$solicitudId]);
+        $bloqueo = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!empty($bloqueo['evaluacion_seleccionada'])
+            && !empty($bloqueo['usuario_seleccionado_id'])
+            && (int)$bloqueo['usuario_seleccionado_id'] !== (int)$_SESSION['user_id']
+        ) {
+            $entidad = trim((string)($bloqueo['entidad_seleccionada'] ?? ''));
+            $agente = trim((string)($bloqueo['agente_seleccionado'] ?? ''));
+            $detalle = $entidad !== '' ? $entidad : ($agente !== '' ? $agente : 'otra entidad bancaria');
+            echo json_encode([
+                'success' => false,
+                'code' => 'PROPUESTA_YA_SELECCIONADA',
+                'message' => 'Esta solicitud ya tiene una propuesta seleccionada (' . $detalle . '). '
+                    . 'Su evaluación/decisión no será procesada. Actualice la página para ver el estado actual.',
+            ]);
+            return;
+        }
+        
+        // Guardar evaluación en la tabla de historial
+        $letraQuincenal = $_POST['letra_quincenal_evaluacion'] ?? null;
+        if ($letraQuincenal === '') {
+            $letraQuincenal = null;
+        }
+
+        $promocion = trim((string) ($_POST['promocion_evaluacion'] ?? ''));
+        if ($promocion === '') {
+            $promocion = null;
+        }
+
+        $cuantia = $_POST['cuantia_evaluacion'] ?? null;
+        if ($cuantia === '' || $promocion === null) {
+            $cuantia = null;
+        } elseif ($cuantia !== null && is_numeric($cuantia)) {
+            $cuantia = (float) $cuantia;
+        } else {
+            $cuantia = null;
+        }
+
+        $razonesCondicionales = [
+            'Documentación pendiente o actualización de información',
+            'Validación de ingresos y estabilidad laboral',
+            'Presentar carta laboral actualizada',
+            'Presentar codeudor o fiador',
+            'Corrección de observaciones crediticias',
+            'Aprobación o validación interna requerida',
+            'Se recomienda incrementar abono y/o evaluar un auto de menor precio',
+            'Corregir discrepancias en buró de crédito',
+            'Cumplir antigüedad laboral mínima requerida',
+            'Sujeto a aprobación de comité de crédito',
+        ];
+        $razonesRechazo = [
+            'Capacidad de pago insuficiente',
+            'Endeudamiento elevado',
+            'Historial crediticio desfavorable',
+            'Incumplimiento de políticas de crédito',
+            'Inestabilidad laboral',
+            'Negocio propio sin suficiente trayectoria',
+            'Inconsistencias entre lo declarado y lo evidenciado',
+            'Perfil de riesgo no aceptable',
+            'Empresa no elegible según política de crédito vigente',
+        ];
+
+        $razon = trim((string) ($_POST['razon_evaluacion'] ?? ''));
+        $razonesPermitidas = [];
+        if ($decision === 'preaprobado' || $decision === 'aprobado_condicional') {
+            $razonesPermitidas = $razonesCondicionales;
+        } elseif ($decision === 'rechazado') {
+            $razonesPermitidas = $razonesRechazo;
+        }
+
+        if ($razonesPermitidas !== []) {
+            if ($razon === '' || !in_array($razon, $razonesPermitidas, true)) {
+                echo json_encode(['success' => false, 'message' => 'Debe seleccionar una razón válida para la decisión']);
+                return;
+            }
+        } else {
+            // Aprobado no requiere razón.
+            $razon = null;
+        }
+
+        $comentariosEval = trim((string) ($_POST['comentarios_evaluacion'] ?? ''));
+        if ($decision === 'rechazado' && $comentariosEval === '') {
+            echo json_encode(['success' => false, 'message' => 'En un rechazo el comentario es obligatorio']);
+            return;
+        }
+
+        $hasLetraQ = evaluaciones_tiene_letra_quincenal($pdo);
+        $hasCuantia = evaluaciones_tiene_cuantia($pdo);
+        $hasRazon = evaluaciones_tiene_razon($pdo);
+
+        $cols = [
+            'solicitud_id', 'vehiculo_id', 'usuario_banco_id', 'decision',
+        ];
+        $vals = [
+            $solicitudId,
+            !empty($_POST['vehiculo_evaluacion']) ? $_POST['vehiculo_evaluacion'] : null,
+            $asignacion['id'],
+            $decision,
+        ];
+
+        if ($hasRazon) {
+            $cols[] = 'razon';
+            $vals[] = $razon;
+        }
+
+        $cols = array_merge($cols, ['valor_financiar', 'abono', 'plazo', 'letra']);
+        $vals = array_merge($vals, [
+            $_POST['valor_financiar'] ?? null,
+            $_POST['abono_evaluacion'] ?? null,
+            $_POST['plazo_evaluacion'] ?? null,
+            $_POST['letra_evaluacion'] ?? null,
+        ]);
+
+        if ($hasLetraQ) {
+            $cols[] = 'letra_quincenal';
+            $vals[] = $letraQuincenal;
+        }
+
+        $cols[] = 'promocion';
+        $vals[] = $promocion;
+
+        if ($hasCuantia) {
+            $cols[] = 'cuantia';
+            $vals[] = $cuantia;
+        }
+
+        $cols[] = 'tasa_bancaria';
+        $vals[] = $tasaBancaria;
+        $cols[] = 'comentarios';
+        $vals[] = $comentariosEval !== '' ? $comentariosEval : null;
+
+        $placeholders = implode(', ', array_fill(0, count($cols), '?'));
+        $stmt = $pdo->prepare(
+            'INSERT INTO evaluaciones_banco (' . implode(', ', $cols) . ') VALUES (' . $placeholders . ')'
+        );
+        $stmt->execute($vals);
+        
+        $evaluacionId = $pdo->lastInsertId();
+        
+        // Actualizar la solicitud con la última decisión
+        $stmt = $pdo->prepare("
+            UPDATE solicitudes_credito 
+            SET respuesta_banco = ?,
+                letra = ?,
+                plazo = ?,
+                abono_banco = ?,
+                promocion = ?,
+                comentarios_ejecutivo_banco = ?,
+                banco_id = ?
+            WHERE id = ?
+        ");
+        
+        // Convertir decisión a formato del ENUM
+        $respuestaBancoEnum = '';
+        switch($decision) {
+            case 'preaprobado':
+                $respuestaBancoEnum = 'Pre Aprobado';
+                break;
+            case 'aprobado':
+                $respuestaBancoEnum = 'Aprobado';
+                break;
+            case 'aprobado_condicional':
+                $respuestaBancoEnum = 'Aprobado Condicional';
+                break;
+            case 'rechazado':
+                $respuestaBancoEnum = 'Rechazado';
+                break;
+        }
+        
+        $stmt->execute([
+            $respuestaBancoEnum,
+            $_POST['letra_evaluacion'] ?? null,
+            $_POST['plazo_evaluacion'] ?? null,
+            $_POST['abono_evaluacion'] ?? null,
+            $promocion,
+            $comentariosEval !== '' ? $comentariosEval : null,
+            $_SESSION['user_id'],
+            $solicitudId
+        ]);
+        
+        // Notificaciones por correo:
+        // - Cualquier decisión: vendedor (CC F&I + Pipe vía EmailService). Nunca al banco que respondió.
+        // - Solo aprobado/preaprobado: también al cliente.
+        // - Rechazo: NO se notifica al cliente ni al banco que rechazó.
+        try {
+            require_once '../includes/email_helper.php';
+            
+            if (in_array($respuestaBancoEnum, ['Aprobado', 'Pre Aprobado', 'Rechazado', 'Aprobado Condicional'], true)) {
+                $resultadoEmail = enviarNotificacionVendedor($solicitudId, $evaluacionId);
+                if (!$resultadoEmail['success']) {
+                    error_log("No se pudo enviar correo al vendedor: " . $resultadoEmail['message']);
+                }
+                
+                if (in_array($respuestaBancoEnum, ['Aprobado', 'Pre Aprobado'], true)) {
+                    $resultadoCliente = notificarClienteAprobacion($solicitudId, $evaluacionId);
+                    if (!$resultadoCliente['success']) {
+                        error_log("No se pudo enviar correo al cliente: " . $resultadoCliente['message']);
+                    }
+                }
+            }
+        } catch (Exception $e) {
+            // Si no se puede cargar email_helper (Composer no instalado), continuar sin enviar correo
+            error_log("No se pudo cargar email_helper: " . $e->getMessage());
+        }
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Evaluación guardada correctamente',
+            'data' => ['id' => $evaluacionId]
+        ]);
+        
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error al guardar evaluación: ' . $e->getMessage()]);
+    }
+}
+
+function seleccionarPropuesta() {
+    global $pdo;
+    
+    try {
+        // Verificar que el usuario es admin o gestor
+        if (!isset($_SESSION['user_roles']) || (!in_array('ROLE_ADMIN', $_SESSION['user_roles']) && !in_array('ROLE_GESTOR', $_SESSION['user_roles']))) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Solo los administradores y gestores pueden seleccionar propuestas']);
+            return;
+        }
+
+        $criteriosValidos = [
+            'ABONO MINIMO',
+            'TASAS',
+            'PLAZOS',
+            'PRECIO DE VENTA',
+            'Monto Mínimo a Financiar',
+            'APLICAN AUTOS DESDE (Año)',
+            'SALARIO',
+            'SCORE',
+            'NIVEL DE ENDEUDAMIENTO (%)',
+            'Estabilidad laboral',
+            'Edad mínima',
+            'Kilometraje',
+            'AVALUO',
+            'BONO PROMOCION',
+        ];
+        
+        // Validar campos
+        if (empty($_POST['evaluacion_id']) || empty($_POST['solicitud_id']) || empty($_POST['comentario']) || empty($_POST['criterio'])) {
+            echo json_encode(['success' => false, 'message' => 'Todos los campos son requeridos']);
+            return;
+        }
+        
+        $evaluacionId = $_POST['evaluacion_id'];
+        $solicitudId = $_POST['solicitud_id'];
+        $comentario = trim((string) $_POST['comentario']);
+        $criterio = trim((string) $_POST['criterio']);
+
+        if (!in_array($criterio, $criteriosValidos, true)) {
+            echo json_encode(['success' => false, 'message' => 'Criterio de aceptación no válido']);
+            return;
+        }
+        
+        // Obtener la evaluación seleccionada
+        $stmt = $pdo->prepare("SELECT * FROM evaluaciones_banco WHERE id = ?");
+        $stmt->execute([$evaluacionId]);
+        $evaluacion = $stmt->fetch();
+        
+        if (!$evaluacion) {
+            echo json_encode(['success' => false, 'message' => 'Evaluación no encontrada']);
+            return;
+        }
+
+        asegurarColumnaCriterioSeleccionPropuesta($pdo);
+        
+                  // Actualizar la solicitud con la evaluación seleccionada
+          $stmt = $pdo->prepare("
+              UPDATE solicitudes_credito 
+              SET evaluacion_seleccionada = ?,
+                  fecha_aprobacion_propuesta = NOW(),
+                  comentario_seleccion_propuesta = ?,
+                  criterio_seleccion_propuesta = ?
+              WHERE id = ?
+          ");
+          $stmt->execute([$evaluacionId, $comentario, $criterio, $solicitudId]);
+
+        // Notificar al usuario banco dueño de la propuesta (CC: F&I + Pipe)
+        $mensajeEmail = '';
+        try {
+            require_once __DIR__ . '/../includes/email_helper.php';
+            $resultadoEmail = notificarPropuestaSeleccionada((int) $solicitudId, (int) $evaluacionId, (string) $comentario, (string) $criterio);
+            if (!empty($resultadoEmail['success'])) {
+                $mensajeEmail = ' Se notificó por correo al usuario banco.';
+            } else {
+                error_log('No se pudo enviar correo de propuesta seleccionada: ' . ($resultadoEmail['message'] ?? ''));
+                $mensajeEmail = ' (No se pudo enviar el correo al banco: ' . ($resultadoEmail['message'] ?? 'error') . ')';
+            }
+        } catch (Throwable $e) {
+            error_log('No se pudo cargar email_helper (propuesta seleccionada): ' . $e->getMessage());
+            $mensajeEmail = ' (Correo no enviado: servicio de email no disponible)';
+        }
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Propuesta seleccionada correctamente. Los demás bancos ya no podrán interactuar con esta solicitud.' . $mensajeEmail
+        ]);
+        
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error al seleccionar propuesta: ' . $e->getMessage()]);
+    }
+}
+
+function asegurarColumnaCriterioSeleccionPropuesta(PDO $pdo): void
+{
+    static $ok = false;
+    if ($ok) {
+        return;
+    }
+    try {
+        $st = $pdo->query("SHOW COLUMNS FROM solicitudes_credito LIKE 'criterio_seleccion_propuesta'");
+        if ($st && !$st->fetch()) {
+            $pdo->exec("
+                ALTER TABLE solicitudes_credito
+                ADD COLUMN criterio_seleccion_propuesta varchar(120) DEFAULT NULL
+                COMMENT 'Motivo de aceptación de la propuesta (select obligatorio)'
+                AFTER comentario_seleccion_propuesta
+            ");
+        }
+        $ok = true;
+    } catch (Throwable $e) {
+        error_log('asegurarColumnaCriterioSeleccionPropuesta: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Quita la propuesta seleccionada para que todos los bancos puedan interactuar de nuevo.
+ */
+function activarNuevamentePropuestas() {
+    global $pdo;
+
+    try {
+        if (!isset($_SESSION['user_roles']) || (!in_array('ROLE_ADMIN', $_SESSION['user_roles']) && !in_array('ROLE_GESTOR', $_SESSION['user_roles']))) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Solo los administradores y gestores pueden activar nuevamente las propuestas']);
+            return;
+        }
+
+        if (empty($_POST['solicitud_id'])) {
+            echo json_encode(['success' => false, 'message' => 'Solicitud requerida']);
+            return;
+        }
+
+        $solicitudId = (int) $_POST['solicitud_id'];
+
+        $stmt = $pdo->prepare("
+            SELECT id, evaluacion_seleccionada
+            FROM solicitudes_credito
+            WHERE id = ?
+        ");
+        $stmt->execute([$solicitudId]);
+        $solicitud = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$solicitud) {
+            echo json_encode(['success' => false, 'message' => 'Solicitud no encontrada']);
+            return;
+        }
+
+        if (empty($solicitud['evaluacion_seleccionada'])) {
+            echo json_encode(['success' => false, 'message' => 'No hay una propuesta seleccionada para esta solicitud']);
+            return;
+        }
+
+        asegurarColumnaCriterioSeleccionPropuesta($pdo);
+
+        $stmt = $pdo->prepare("
+            UPDATE solicitudes_credito
+            SET evaluacion_seleccionada = NULL,
+                fecha_aprobacion_propuesta = NULL,
+                comentario_seleccion_propuesta = NULL,
+                criterio_seleccion_propuesta = NULL,
+                evaluacion_en_reevaluacion = NULL
+            WHERE id = ?
+        ");
+        $stmt->execute([$solicitudId]);
+
+        echo json_encode([
+            'success' => true,
+            'message' => 'Solicitud reactivada. Todos los bancos habilitados pueden volver a interactuar y podrá seleccionar otra propuesta.'
+        ]);
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error al activar nuevamente: ' . $e->getMessage()]);
+    }
+}
+
+function solicitarReevaluacion() {
+    global $pdo;
+    
+    try {
+        // Verificar que el usuario es admin o gestor
+        if (!isset($_SESSION['user_roles']) || (!in_array('ROLE_ADMIN', $_SESSION['user_roles']) && !in_array('ROLE_GESTOR', $_SESSION['user_roles']))) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Solo los administradores y gestores pueden solicitar reevaluación']);
+            return;
+        }
+        
+        // Validar campos
+        if (empty($_POST['evaluacion_id']) || empty($_POST['solicitud_id']) || empty($_POST['comentario'])) {
+            echo json_encode(['success' => false, 'message' => 'Todos los campos son requeridos']);
+            return;
+        }
+        
+        $evaluacionId = $_POST['evaluacion_id'];
+        $solicitudId = $_POST['solicitud_id'];
+        $comentario = $_POST['comentario'];
+        
+        // Obtener la evaluación
+        $stmt = $pdo->prepare("SELECT * FROM evaluaciones_banco WHERE id = ?");
+        $stmt->execute([$evaluacionId]);
+        $evaluacion = $stmt->fetch();
+        
+        if (!$evaluacion) {
+            echo json_encode(['success' => false, 'message' => 'Evaluación no encontrada']);
+            return;
+        }
+        
+        // Actualizar la solicitud marcando la evaluación para reevaluación
+        $stmt = $pdo->prepare("
+            UPDATE solicitudes_credito 
+            SET evaluacion_en_reevaluacion = ?
+            WHERE id = ?
+        ");
+        $stmt->execute([$evaluacionId, $solicitudId]);
+
+        // Guardar el motivo en la evaluación para que el banco lo vea en «Ver mis respuestas»
+        $stmt = $pdo->prepare("
+            UPDATE evaluaciones_banco
+            SET comentario_reevaluacion_solicitada = ?,
+                fecha_solicitud_reevaluacion = NOW()
+            WHERE id = ?
+        ");
+        $stmt->execute([$comentario, $evaluacionId]);
+        
+        // Enviar notificación SOLO al usuario banco de esa evaluación
+        $mensajeEmail = '';
+        try {
+            require_once '../includes/email_helper.php';
+            $resultadoEmail = notificarReevaluacion($solicitudId, $evaluacionId, $comentario);
+            if (!empty($resultadoEmail['success'])) {
+                $mensajeEmail = ' Se notificó por correo al usuario banco.';
+            } else {
+                error_log('No se pudo enviar correo de reevaluación: ' . ($resultadoEmail['message'] ?? ''));
+                $mensajeEmail = ' (No se pudo enviar el correo al banco: ' . ($resultadoEmail['message'] ?? 'error') . ')';
+            }
+        } catch (Exception $e) {
+            error_log('No se pudo cargar email_helper: ' . $e->getMessage());
+            $mensajeEmail = ' (Correo no enviado: servicio de email no disponible)';
+        }
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Reevaluación solicitada correctamente.' . $mensajeEmail
+        ]);
+        
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error al solicitar reevaluación: ' . $e->getMessage()]);
+    }
+}
+

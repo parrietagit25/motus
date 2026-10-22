@@ -1,0 +1,67 @@
+# Configuración del servidor web
+RewriteEngine On
+
+# Redirigir a HTTPS si está disponible (descomentar en producción)
+# RewriteCond %{HTTPS} off
+# RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+# Proteger archivos sensibles (también en subcarpetas)
+RewriteRule "(?:^|/)(?:database|logs|backup|backups)(?:/|$)" - [F,L]
+RewriteRule "(?:^|/)(?:docker-compose\.ya?ml|Dockerfile(?:\..*)?)$" - [F,L]
+RewriteRule "\.(?:sql|log|bak|old|ini|pem|key|sh)$" - [F,L]
+# Herramientas de depuración: no deben ser públicas
+RewriteRule "(?:^|/)debug_[^/]*\.php$" - [F,L]
+
+<Files "*.sql">
+    Require all denied
+</Files>
+
+# Bloquear variables de entorno, llaves, respaldos y otros secretos
+<FilesMatch "^(?:\.env|\.env\..*|composer\.(?:json|lock)|package(?:-lock)?\.json|yarn\.lock|.*\.(?:ini|log|sh|bak|old|dist|swp|pem|key))$">
+    Require all denied
+</FilesMatch>
+
+# Bloquear cualquier archivo oculto/directorio oculto (ej: .git, .svn, etc.)
+RewriteRule "(^|/)\." - [F,L]
+
+<Files "*.php">
+    Order allow,deny
+    Allow from all
+</Files>
+
+# Respaldo específico para .git (además del bloqueo general de dotfiles)
+RedirectMatch 404 /\.git
+
+
+# Configuración de seguridad
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options nosniff
+    Header always set X-Frame-Options DENY
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+    Header always set Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://code.jquery.com https://cdn.datatables.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://cdn.datatables.net https://fonts.googleapis.com; font-src 'self' data: https://cdnjs.cloudflare.com https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' https://cdn.jsdelivr.net https://cdn.datatables.net https://code.jquery.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+</IfModule>
+
+# Configuración de caché para archivos estáticos
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+    ExpiresByType image/png "access plus 1 month"
+    ExpiresByType image/jpg "access plus 1 month"
+    ExpiresByType image/jpeg "access plus 1 month"
+    ExpiresByType image/gif "access plus 1 month"
+</IfModule>
+
+# Compresión GZIP
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/plain
+    AddOutputFilterByType DEFLATE text/html
+    AddOutputFilterByType DEFLATE text/xml
+    AddOutputFilterByType DEFLATE text/css
+    AddOutputFilterByType DEFLATE application/xml
+    AddOutputFilterByType DEFLATE application/xhtml+xml
+    AddOutputFilterByType DEFLATE application/rss+xml
+    AddOutputFilterByType DEFLATE application/javascript
+    AddOutputFilterByType DEFLATE application/x-javascript
+</IfModule>

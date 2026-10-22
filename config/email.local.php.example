@@ -1,0 +1,15 @@
+<?php
+/**
+ * Opcional: copiar a email.local.php (no se sube a git).
+ * Si existe email.local.php, sustituye por completo la configuración de config/email.php.
+ */
+return [
+    'resend_api_key' => 're_xxxxxxxxxxxxxxxxxxxxxxxx',
+    'resend_base_url' => 'api.resend.com',
+    'from_email' => 'onboarding@resend.dev',
+    'from_name' => 'AutoMarket Seminuevos',
+    'reply_to_email' => '',
+    'reply_to_name' => 'AutoMarket - Soporte',
+    'app_url' => 'http://localhost:8086',
+    'app_name' => 'AutoMarket Seminuevos',
+];

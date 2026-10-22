@@ -1,0 +1,93 @@
+# ============================================================
+# Motus — exclusiones de seguridad
+# Nunca versionar secretos, respaldos, datos de clientes ni logs.
+# ============================================================
+
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+user.txt
+CREDENCIALES*.txt
+configurar_sendgrid_servidor.sh
+config/email.local.php
+financiamiento/config_db.php
+inventario_web/api_web_export.config.php
+
+# Bases de datos y respaldos: todo .sql queda fuera salvo la lista permitida de abajo
+*.sql
+*.sql.gz
+*.gz
+*.zip
+*.tar
+*.dump
+*.bak
+*.backup
+*.old
+*.sqlite
+*.sqlite3
+*.db
+*_backup.php
+backups/
+backup/
+motus_backups/
+database/backups/
+
+# SQL permitido: solo estructura, migraciones y scripts sin datos reales
+!database/migracion_*.sql
+!database/schema_motus.sql
+!database/recovery_fase*.sql
+!database/automarket_invs_web.sql
+!database/backfill_vehiculos_unidad_desde_reservas.sql
+!database/consulta_columna_vehiculo_reserva.sql
+!database/historial_solicitud.sql
+!database/link_financiamiento.sql
+!financiamiento/database.sql
+
+# Documentos de clientes (volumen Docker en producción)
+adjuntos/*
+
+# Logs y temporales
+*.log
+logs/
+tmp/
+temp/
+cache/
+sessions/
+*.tmp
+*.temp
+*.swp
+*.swo
+inventario_web/script_log_desde_python.txt
+inventario_web/Error_subida.txt
+
+# Herramientas de depuración y pruebas locales (no públicas)
+debug_*.php
+verificar_*.php
+ejecutar_*.php
+migrar_*.php
+test_*.html
+
+# Dependencias y herramientas
+/vendor/
+/node_modules/
+.venv/
+__pycache__/
+
+# Configuración local / sistema
+.vscode/
+.idea/
+.cursor/
+.DS_Store
+Thumbs.db
+HISTORIAL_TAREAS.md

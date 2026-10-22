@@ -1,0 +1,3178 @@
+// Inicializar DataTable para solicitudes
+$(document).ready(function() {
+    console.log('=== INICIALIZANDO SOLICITUDES ===');
+    
+    // Deshabilitar campos si el usuario es banco
+    if (window.userRoles && window.userRoles.isBanco) {
+        deshabilitarCamposParaBanco();
+    }
+    
+    cargarSolicitudes();
+
+    // Abrir solicitud desde enlaces externos (ej. Mis propuestas)
+    var urlParams = new URLSearchParams(window.location.search);
+    var abrirSolicitudId = urlParams.get('abrir_solicitud');
+    if (abrirSolicitudId && /^\d+$/.test(abrirSolicitudId)) {
+        setTimeout(function () {
+            if (typeof editarSolicitud === 'function') {
+                editarSolicitud(parseInt(abrirSolicitudId, 10));
+            }
+            try {
+                window.history.replaceState({}, document.title, window.location.pathname);
+            } catch (e) { /* ignore */ }
+        }, 600);
+    }
+
+    // Configurar formulario de solicitudes usando delegación de eventos
+    $(document).on('submit', '#solicitudForm', function(e) {
+        console.log('=== FORMULARIO ENVIADO (delegado) ===');
+        e.preventDefault();
+        e.stopPropagation();
+        guardarSolicitud();
+        return false;
+    });
+    
+    // También agregar event listener directo por si acaso
+    $('#solicitudForm').on('submit', function(e) {
+        console.log('=== FORMULARIO ENVIADO (directo) ===');
+        e.preventDefault();
+        e.stopPropagation();
+        guardarSolicitud();
+        return false;
+    });
+    
+    // Event listener adicional directamente en el botón de guardar (por si el submit no funciona)
+    $(document).on('click', '#solicitudForm button[type="submit"]', function(e) {
+        console.log('=== CLICK EN BOTÓN GUARDAR ===');
+        e.preventDefault();
+        e.stopPropagation();
+        const form = $(this).closest('form');
+        if (form.length > 0 && form.attr('id') === 'solicitudForm') {
+            console.log('Ejecutando guardarSolicitud desde click del botón');
+            guardarSolicitud();
+        }
+        return false;
+    });
+    
+    // Configurar formulario de notas (delegado para formularios dinámicos)
+    $(document).on('submit', '.formNotaMuro', function(e) {
+        e.preventDefault();
+        enviarNotaMuro($(this));
+    });
+    
+    // Configurar formulario de notas antiguo por compatibilidad
+    $('#notaForm').on('submit', function(e) {
+        e.preventDefault();
+        enviarNota();
+    });
+    
+    // El formulario de adjuntos ahora usa onclick en el botón
+    
+    // Configurar funcionalidad de usuarios banco
+    configurarUsuariosBanco();
+
+    // Autos disponibles (modal): mismo patrón que solicitudes — $.ajax y luego DataTable con los datos
+    $('#autosDisponiblesModal').on('shown.bs.modal', function() {
+        $('#autosDisponiblesError').addClass('d-none').empty();
+        if ($.fn.DataTable.isDataTable('#tablaAutosDisponibles')) {
+            $('#tablaAutosDisponibles').DataTable().destroy();
+            $('#tablaAutosDisponibles tbody').empty();
+        }
+        $.ajax({
+            url: '/api/autos_disponibles.php',
+            type: 'GET',
+            dataType: 'json',
+            success: function(response) {
+                if (response && response.success === false && response.message) {
+                    $('#autosDisponiblesError').text(response.message).removeClass('d-none');
+                    return;
+                }
+                var datos = (response && response.data) ? response.data : [];
+                $('#tablaAutosDisponibles').DataTable({
+                    data: datos,
+                    columns: [
+                        {
+                            data: null,
+                            orderable: false,
+                            searchable: false,
+                            render: function(row) {
+                                var photo = row.Photo && String(row.Photo).trim() ? row.Photo : '';
+                                var unit = (row.Unit && String(row.Unit).trim()) ? row.Unit : (row.LicensePlate && String(row.LicensePlate).trim()) ? row.LicensePlate : '';
+                                var placa = (row.LicensePlate && String(row.LicensePlate).trim()) ? row.LicensePlate : unit;
+                                if (photo) {
+                                    return '<a href="#" class="ver-imagen-vehiculo d-inline-block" data-photo="' + String(photo).replace(/"/g, '&quot;') + '" data-unit="' + String(unit).replace(/"/g, '&quot;') + '" data-placa="' + String(placa).replace(/"/g, '&quot;') + '" title="Ver imagen"><img src="' + String(photo).replace(/"/g, '&quot;') + '" style="height:50px;object-fit:cover;cursor:pointer" alt=""></a>';
+                                }
+                                return '<span class="text-muted"><i class="fas fa-car"></i></span>';
+                            }
+                        },
+                        { data: 'Make' },
+                        { data: 'Model' },
+                        { data: 'Year' },
+                        {
+                            data: 'Price',
+                            render: function(d) {
+                                return d != null && d !== '' ? '$' + Number(d).toLocaleString('es-PA') : 'N/D';
+                            }
+                        },
+                        { data: 'Transmission' }
+                    ],
+                    order: [[1, 'asc']],
+                    pageLength: 25,
+                    language: {
+                        url: '//cdn.datatables.net/plug-ins/1.13.7/i18n/es-ES.json',
+                        emptyTable: 'No hay vehículos en el inventario.'
+                    }
+                });
+            },
+            error: function(xhr) {
+                var msg = 'No se pudo cargar el inventario.';
+                if (xhr.status === 401) msg = 'Sesión expirada.';
+                else if (xhr.responseJSON && xhr.responseJSON.message) msg = xhr.responseJSON.message;
+                $('#autosDisponiblesError').text(msg).removeClass('d-none');
+            }
+        });
+    });
+    $('#autosDisponiblesModal').on('hidden.bs.modal', function() {
+        if ($.fn.DataTable.isDataTable('#tablaAutosDisponibles')) {
+            $('#tablaAutosDisponibles').DataTable().destroy();
+            $('#tablaAutosDisponibles tbody').empty();
+        }
+    });
+
+    // Click en imagen de autos disponibles: abrir modal con imagen grande y link Impel (por placa/unidad)
+    $(document).on('click', '#tablaAutosDisponibles .ver-imagen-vehiculo', function(e) {
+        e.preventDefault();
+        var photo = $(this).data('photo') || '';
+        var placa = $(this).data('placa') || $(this).data('unit') || '';
+        var segmento = String(placa).toLowerCase().trim();
+        var urlImpel = 'https://spins.impel.io/automarketpanama/' + (segmento ? encodeURIComponent(segmento) : '');
+        $('#imagenVehiculoGrande').attr('src', photo);
+        var $link = $('#imagenVehiculoLinkImpel').attr('href', urlImpel);
+        if (segmento) { $link.removeClass('d-none').show(); } else { $link.addClass('d-none').hide(); }
+        $('#imagenVehiculoModal').modal('show');
+    });
+
+    // Cargar desde Sol Financiamiento: el listado se pide desde limpiarFormularioSolicitud() / llenarFormularioEdicion()
+    // para no ejecutar show.bs.modal antes del onclick (solicitud_id stale filtraba todos los registros).
+    $('#solicitudModal').on('hidden.bs.modal', function() {
+        destruirClienteFinanciamientoSelect2();
+    });
+    $('#cliente_financiamiento_select').on('change', function() {
+        var id = $(this).val();
+        if (!id) {
+            $('#financiamiento_registro_id').val('');
+            return;
+        }
+        cargarRegistroFinanciamientoYPrefill(id);
+    });
+
+    $('#importPdfModal').on('hidden.bs.modal', function() {
+        var form = $('#importPdfForm')[0];
+        if (form) form.reset();
+        $('#btnImportarPdf').prop('disabled', false).html('<i class="fas fa-upload me-2"></i>Cargar y prellenar');
+    });
+    $(document).on('submit', '#importPdfForm', function(e) {
+        e.preventDefault();
+        var form = this;
+        if (!form.checkValidity()) {
+            form.reportValidity();
+            return false;
+        }
+        var fd = new FormData(form);
+        var $btn = $('#btnImportarPdf');
+        var original = $btn.html();
+        $btn.prop('disabled', true).html('<i class="fas fa-spinner fa-spin me-2"></i>Procesando PDF...');
+        $.ajax({
+            url: 'api/importar_solicitud_pdf.php',
+            type: 'POST',
+            data: fd,
+            processData: false,
+            contentType: false,
+            dataType: 'json',
+            success: function(res) {
+                $btn.prop('disabled', false).html(original);
+                if (!res || !res.success) {
+                    var msgRes = (res && res.message) ? res.message : 'No se pudo procesar el PDF.';
+                    if (res && res.error_detail) {
+                        msgRes += '\n\nDetalle: ' + res.error_detail;
+                    }
+                    mostrarAlerta(msgRes, 'danger');
+                    return;
+                }
+                $('#importPdfModal').modal('hide');
+                limpiarFormularioSolicitud();
+                var data = res.data || {};
+                if (data.prefill) {
+                    prefillFormularioDesdeFinanciamiento(data.prefill);
+                }
+                if (data.tipo_persona) {
+                    $('#tipo_persona').val(data.tipo_persona);
+                }
+                if (data.perfil_financiero) {
+                    $('#perfil_financiero').val(data.perfil_financiero);
+                }
+                if (data.token) {
+                    $('#import_pdf_token').val(data.token);
+                }
+                if (data.nombre_original) {
+                    $('#import_pdf_nombre_original').val(data.nombre_original);
+                }
+                $('#solicitudModal').modal('show');
+                mostrarAlerta('PDF cargado. Verifique los datos prellenados y guarde la solicitud.', 'success');
+            },
+            error: function(xhr) {
+                $btn.prop('disabled', false).html(original);
+                var msg = 'Error al procesar el PDF.';
+                try {
+                    var json = JSON.parse(xhr.responseText || '{}');
+                    if (json.message) msg = json.message;
+                    if (json.error_detail) msg += '\n\nDetalle: ' + json.error_detail;
+                } catch (err) {}
+                mostrarAlerta(msg, 'danger');
+            }
+        });
+        return false;
+    });
+
+    // Contador de caracteres para comentarios
+    $('#comentarios_gestor').on('input', function() {
+        const maxLength = 1000;
+        const currentLength = $(this).val().length;
+        const remaining = maxLength - currentLength;
+        $('#contador_comentarios').text(remaining);
+        
+        if (remaining < 0) {
+            $('#contador_comentarios').addClass('text-danger');
+        } else {
+            $('#contador_comentarios').removeClass('text-danger');
+        }
+    });
+    
+    // Limpiar al cerrar el modal de cambio de estado
+    $('#cambioEstadoModal').on('hidden.bs.modal', function() {
+        $('#nuevo_estado').val('');
+        $('#nota_cambio_estado').val('');
+        $('#notas_cambio_estado_count').text('');
+        $('#tablaNotasCambioEstado tbody').html(
+            '<tr><td colspan="5" class="text-center text-muted">Cargando notas...</td></tr>'
+        );
+    });
+    
+    // Event listener cuando el modal de solicitud se muestra
+    $('#solicitudModal').on('shown.bs.modal', function() {
+        console.log('=== MODAL DE SOLICITUD ABIERTO ===');
+        
+        // Asegurarse de que el event listener del formulario esté activo
+        const form = $('#solicitudForm');
+        if (form.length > 0) {
+            console.log('Formulario encontrado, configurando event listeners...');
+            
+            // Remover event listeners anteriores para evitar duplicados
+            form.off('submit');
+            
+            // Agregar event listener del submit
+            form.on('submit', function(e) {
+                console.log('=== FORMULARIO ENVIADO (modal abierto) ===');
+                e.preventDefault();
+                e.stopPropagation();
+                guardarSolicitud();
+                return false;
+            });
+            
+            // Event listener en el botón directamente
+            const btnGuardar = $('#btnGuardarSolicitud');
+            if (btnGuardar.length > 0) {
+                console.log('Botón de guardar encontrado');
+                btnGuardar.off('click').on('click', function(e) {
+                    console.log('=== CLICK EN BOTÓN GUARDAR (modal abierto) ===');
+                    e.preventDefault();
+                    e.stopPropagation();
+                    guardarSolicitud();
+                    return false;
+                });
+            }
+        }
+    });
+});
+
+// Función para inicializar DataTable de forma segura
+function inicializarDataTable() {
+    try {
+        // Destruir DataTable existente si existe
+        if ($.fn.DataTable.isDataTable('#solicitudesTable')) {
+            console.log('Destruyendo DataTable existente...');
+            $('#solicitudesTable').DataTable().destroy();
+        }
+        
+        // Verificar que las filas estén completamente renderizadas
+        const filas = $('#solicitudesTable tbody tr');
+        console.log('Filas encontradas:', filas.length);
+        
+        if (filas.length === 0) {
+            console.warn('No hay filas para mostrar, reintentando en 100ms...');
+            setTimeout(inicializarDataTable, 100);
+            return;
+        }
+        
+        // Verificar que la primera fila tenga el número correcto de columnas
+        const primeraFila = filas.first();
+        const columnas = primeraFila.find('td').length;
+        const columnasHeader = $('#solicitudesTable thead th').length;
+        
+        console.log('Columnas en fila:', columnas, 'Columnas en header:', columnasHeader);
+        
+        if (columnas !== columnasHeader) {
+            console.error('❌ Desajuste de columnas detectado, reintentando...');
+            setTimeout(inicializarDataTable, 200);
+            return;
+        }
+        
+        console.log('Inicializando DataTable de solicitudes...');
+        
+        // Detectar dinámicamente la última columna (acciones)
+        const ultimaColumna = columnasHeader - 1;
+        
+        $('#solicitudesTable').DataTable({
+            language: {
+                url: 'https://cdn.datatables.net/plug-ins/1.13.7/i18n/es-ES.json'
+            },
+            responsive: true,
+            order: [],
+            pageLength: 10,
+            lengthMenu: [[5, 10, 25, 50], [5, 10, 25, 50]],
+            columnDefs: [
+                { type: 'num', targets: 0 },
+                { orderable: false, targets: [ultimaColumna] }
+            ],
+            autoWidth: false,
+            processing: true,
+            deferRender: true
+        });
+        
+        console.log('✅ DataTable de solicitudes inicializado correctamente');
+        
+    } catch (error) {
+        console.error('❌ Error al inicializar DataTable de solicitudes:', error);
+        console.error('Detalles del error:', error.message);
+    }
+}
+
+// Función para inicializar DataTable (las solicitudes ya vienen del HTML)
+function textoVehiculoLista(solicitud) {
+    if (parseInt(solicitud.tiene_reserva_aplicada, 10) <= 0) {
+        return '';
+    }
+    if (solicitud.texto_vehiculo) {
+        return solicitud.texto_vehiculo;
+    }
+    const unidad = String(solicitud.veh_unidad || '').trim();
+    const marca = String(solicitud.veh_marca || solicitud.marca_auto || '').trim();
+    const modelo = String(solicitud.veh_modelo || solicitud.modelo_auto || '').trim();
+    const anio = String(solicitud.veh_anio || solicitud.año_auto || solicitud.ao_auto || '').trim();
+    const desc = (marca + ' ' + modelo + ' ' + anio).trim();
+    if (unidad && desc) {
+        return unidad + ' — ' + desc;
+    }
+    if (unidad) {
+        return unidad;
+    }
+    return desc;
+}
+
+function cargarSolicitudes() {
+    // Verificar si la tabla tiene filas ya cargadas desde el servidor
+    const filasExistentes = $('#solicitudesTable tbody tr').length;
+    console.log('Filas existentes en el HTML:', filasExistentes);
+    
+    if (filasExistentes > 0) {
+        // Si hay filas en el HTML, simplemente inicializar DataTable sin recargar
+        console.log('Inicializando DataTable con datos existentes del HTML');
+        setTimeout(inicializarDataTable, 300);
+        return;
+    }
+    
+    // Si no hay filas, cargar desde la API (caso normal)
+    $.ajax({
+        url: 'api/solicitudes.php',
+        type: 'GET',
+        data: window.MOTUS_ES_HISTORICO ? { historico: 1 } : {},
+        dataType: 'json',
+        success: function(response) {
+            console.log('Respuesta de la API:', response);
+            if (response.success) {
+                const tbody = $('#solicitudesTable tbody');
+                tbody.empty();
+                
+                console.log('Datos recibidos:', response.data);
+                let filasGeneradas = 0;
+                const isBancoNoAdmin = window.userRoles && window.userRoles.isBanco && !window.userRoles.isAdmin;
+                function escDataAttr(s) {
+                    return String(s == null ? '' : s)
+                        .replace(/&/g, '&amp;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/</g, '&lt;')
+                        .replace(/\r|\n/g, ' ');
+                }
+                response.data.forEach(function(solicitud) {
+                    const estadoClass = getEstadoClass(solicitud.estado);
+                    const respuestaClass = getRespuestaClass(solicitud.respuesta_banco);
+                    const filaAttr = getFilaAttrSolicitud(solicitud);
+                    const vendedorNombre = (solicitud.vendedor_nombre || '').toString().trim() || 'Sin vendedor';
+                    const idCelda = (window.userRoles && window.userRoles.isAdmin)
+                        ? ('<a href="javascript:void(0);" class="link-cronologia-solicitud text-primary fw-semibold text-decoration-underline" role="button" data-id="' +
+                            solicitud.id + '" data-nombre="' + escDataAttr(solicitud.nombre_cliente) + '" title="Ver cronología de la solicitud">' + solicitud.id + '</a>')
+                        : String(solicitud.id);
+                    
+                    const accionesComunes = `
+                                <div class="btn-group-vertical btn-group-sm" role="group">
+                                    <div class="btn-group btn-group-sm mb-1" role="group">
+                                        <button class="btn btn-info btn-action" onclick="verDetalles(${solicitud.id})" title="Ver Detalles">
+                                            <i class="fas fa-eye"></i>
+                                        </button>
+                                        <button class="btn btn-primary btn-action" onclick="editarSolicitud(${solicitud.id})" title="Editar">
+                                            <i class="fas fa-edit"></i>
+                                        </button>
+                                    </div>
+                                    <div class="btn-group btn-group-sm mb-1" role="group">
+                                        <button class="btn btn-success btn-action" onclick="verMuro(${solicitud.id})" title="Muro de comunicación">
+                                            <i class="fas fa-comments"></i>
+                                        </button>
+                                        <button class="btn btn-warning btn-action" onclick="abrirModalAdjuntosDesdeTabla(${solicitud.id})" title="Gestionar Adjuntos">
+                                            <i class="fas fa-paperclip"></i>
+                                        </button>
+                                    </div>
+                                    ${(window.userRoles && window.userRoles.isBancoAnalista && !['Rechazada', 'Completada', 'Desistimiento'].includes(solicitud.estado)) ? `
+                                    <div class="btn-group btn-group-sm mb-1" role="group">
+                                        <button class="btn btn-success btn-action" onclick="abrirModalAprobacion(${solicitud.id})" title="Aprobar/Rechazar Solicitud">
+                                            <i class="fas fa-gavel"></i>
+                                        </button>
+                                    </div>
+                                    ` : ''}
+                                    ${(window.userRoles && (window.userRoles.isAdmin || window.userRoles.isGestor)) ? `
+                                    <div class="btn-group btn-group-sm mb-1" role="group">
+                                        <button class="btn btn-warning btn-action" onclick="abrirModalCambioEstado(${solicitud.id})" title="Cambiar Estado">
+                                            <i class="fas fa-cogs"></i>
+                                        </button>
+                                    </div>
+                                    ` : ''}
+                                    ${(window.userRoles && window.userRoles.isAdmin) ? `
+                                    <div class="btn-group btn-group-sm" role="group">
+                                        <button class="btn btn-danger btn-action" onclick="eliminarSolicitud(${solicitud.id})" title="Eliminar Solicitud (Solo Admin)">
+                                            <i class="fas fa-trash"></i>
+                                        </button>
+                                    </div>
+                                    ` : ''}
+                                </div>`;
+
+                    let row;
+                    if (isBancoNoAdmin) {
+                        const estadoBancoLabel = solicitud.estado_banco_label || 'Revisión de los bancos';
+                        const estadoBancoClass = solicitud.estado_banco_class || 'estado-revision';
+                        row = `
+                        <tr${filaAttr}>
+                            <td data-order="${solicitud.id}">${idCelda}</td>
+                            <td>${solicitud.nombre_cliente}</td>
+                            <td>${solicitud.cedula}</td>
+                            <td><span class="badge badge-estado ${estadoBancoClass}">${escapeHtml(estadoBancoLabel)}</span></td>
+                            <td>
+                                <button type="button" class="btn btn-sm btn-primary" onclick="verRespuestasBanco(${solicitud.id})" title="Ver mis evaluaciones en esta solicitud">
+                                    <i class="fas fa-clipboard-list me-1"></i>Ver mis respuestas
+                                </button>
+                            </td>
+                            <td>${textoVehiculoLista(solicitud)}</td>
+                            <td>${solicitud.gestor_nombre} ${solicitud.gestor_apellido}</td>
+                            <td>${vendedorNombre}</td>
+                            <td>${formatearFecha(solicitud.fecha_creacion)}</td>
+                            <td>${accionesComunes}</td>
+                        </tr>`;
+                    } else {
+                        row = `
+                        <tr${filaAttr}>
+                            <td data-order="${solicitud.id}">${idCelda}</td>
+                            <td>${solicitud.nombre_cliente}</td>
+                            <td>${textoVehiculoLista(solicitud)}</td>
+                            <td>${solicitud.gestor_nombre} ${solicitud.gestor_apellido}</td>
+                            <td>${vendedorNombre}</td>
+                            <td>
+                                ${solicitud.banco_nombre ? 
+                                    `<span class="badge bg-info">
+                                        ${solicitud.banco_nombre} ${solicitud.banco_apellido}
+                                        ${solicitud.banco_institucion ? `<br><small>(${solicitud.banco_institucion})</small>` : ''}
+                                    </span>` : 
+                                    '<span class="text-muted">Sin asignar</span>'
+                                }
+                            </td>
+                            <td>
+                                <button type="button" class="btn btn-sm btn-primary" onclick="verRespuestasBancoAdmin(${solicitud.id})" title="Ver Respuestas del Banco">
+                                    <i class="fas fa-clipboard-list me-1"></i>Ver Respuestas
+                                </button>
+                            </td>
+                            <td><span class="badge badge-estado ${estadoClass}">${solicitud.estado}</span>${parseInt(solicitud.archivada, 10) === 1 ? '<br><span class="badge bg-secondary mt-1" title="Archivada en histórico sin cambiar su estado">Archivada</span>' : ''}</td>
+                            <!-- <td><span class="badge badge-estado ${respuestaClass}">${solicitud.respuesta_banco}</span></td> -->
+                            <td>${formatearFecha(solicitud.fecha_creacion)}</td>
+                            <td>${accionesComunes}</td>
+                        </tr>`;
+                    }
+                    tbody.append(row);
+                    filasGeneradas++;
+                });
+                
+                console.log('Total de filas generadas:', filasGeneradas);
+                console.log('Filas en tbody:', tbody.find('tr').length);
+                
+                // Verificar que las filas tengan el número correcto de columnas
+                const primeraFila = tbody.find('tr:first');
+                if (primeraFila.length > 0) {
+                    const columnas = primeraFila.find('td').length;
+                    console.log('Número de columnas en la primera fila:', columnas);
+                    console.log('Número de columnas en el header:', $('#solicitudesTable thead th').length);
+                    
+                    if (columnas !== $('#solicitudesTable thead th').length) {
+                        console.error('❌ ERROR: Desajuste en el número de columnas');
+                        console.error('Header:', $('#solicitudesTable thead th').length, 'Body:', columnas);
+                    } else {
+                        console.log('✅ Columnas coinciden correctamente');
+                    }
+                }
+                
+                // Inicializar DataTable después de un delay
+                setTimeout(inicializarDataTable, 300);
+            }
+        },
+        error: function() {
+            mostrarAlerta('Error al cargar solicitudes', 'danger');
+        }
+    });
+}
+
+function getFilaAttrSolicitud(solicitud) {
+    const clases = [];
+    const alertaSinRespuesta2h = solicitud.alerta_sin_respuesta_2h === true
+        || parseInt(solicitud.alerta_sin_respuesta_2h, 10) === 1;
+    if (alertaSinRespuesta2h) {
+        clases.push('solicitud-sin-respuesta-2h');
+    }
+    if (solicitud.estado === 'Aprobada') {
+        clases.push('solicitud-estado-aprobada');
+    }
+    if (!clases.length) {
+        return '';
+    }
+    const title = alertaSinRespuesta2h
+        ? ' title="Enviada a bancos hace más de 2 horas sin ninguna respuesta"'
+        : '';
+    return ' class="' + clases.join(' ') + '"' + title;
+}
+
+// Función para obtener clase CSS del estado
+function getEstadoClass(estado) {
+    const clases = {
+        'Nueva': 'estado-nueva',
+        'En Revisión Banco': 'estado-revision',
+        'Reevaluación por los Bancos': 'estado-revision',
+        'Evaluacion': 'estado-revision',
+        'Comité': 'estado-revision',
+        'Reconsideración': 'estado-revision',
+        'Pend. Firma': 'estado-revision',
+        'Pend. Poliza': 'estado-revision',
+        'Pend. Abono': 'estado-revision',
+        'Pend. Abono y poliza': 'estado-revision',
+        'Pend. CPP': 'estado-revision',
+        'Pre Aprobado': 'estado-aprobada',
+        'Aprobado con Condición': 'estado-aprobada',
+        'Aprobada': 'estado-aprobada',
+        'Rechazada': 'estado-rechazada',
+        'Completada': 'estado-completada',
+        'Desistimiento': 'estado-desistimiento'
+    };
+    return clases[estado] || 'estado-revision';
+}
+
+// Función para obtener clase CSS de la respuesta del banco
+function getRespuestaClass(respuesta) {
+    const clases = {
+        'Pendiente': 'estado-revision',
+        'Aprobado': 'estado-aprobada',
+        'Pre Aprobado': 'estado-revision',
+        'Rechazado': 'estado-rechazada'
+    };
+    return clases[respuesta] || 'estado-revision';
+}
+
+// Función para formatear fecha
+function formatearFecha(fecha) {
+    if (!fecha || fecha === '0000-00-00' || fecha === '0000-00-00 00:00:00') {
+        return '-';
+    }
+    const date = new Date(fecha);
+    if (isNaN(date.getTime())) {
+        return '-';
+    }
+    return date.toLocaleDateString('es-ES') + ' ' + date.toLocaleTimeString('es-ES', {hour: '2-digit', minute: '2-digit'});
+}
+
+// Función para limpiar formulario
+function limpiarFormularioSolicitud() {
+    $('#solicitud_id').val('');
+    $('#solicitudForm')[0].reset();
+    $('#solicitudModalLabel').html('<i class="fas fa-file-alt me-2"></i>Nueva Solicitud de Crédito');
+    $('#contador_comentarios').text('1000');
+    $('#import_pdf_token').val('');
+    $('#import_pdf_nombre_original').val('');
+    
+    // Cargar desde Sol Financiamiento (select + Select2)
+    destruirClienteFinanciamientoSelect2();
+    $('#cliente_financiamiento_select').empty().append($('<option></option>').val('').text('Seleccionar cliente...'));
+    $('#financiamiento_registro_id').val('');
+
+    // Ejecutivo de ventas: limpiar búsqueda y selección
+    $('#buscar_ejecutivo').val('');
+    $('#ejecutivo_ventas_id').val('');
+    
+    // Resetear botones
+    $('#btnCerrarDespuesAdjuntos').hide();
+    $('button[type="submit"]').show();
+    
+    // Activar primera pestaña
+    $('#datos-generales-tab').tab('show');
+    
+    // Ocultar pestaña "Cita y Firma" al crear nueva solicitud
+    $('#cita-firma-tab-li').hide();
+
+    cargarClientesFinanciamientoSelect();
+}
+
+// ==================== Cargar desde Sol Financiamiento (select) ====================
+
+function destruirClienteFinanciamientoSelect2() {
+    var $sel = $('#cliente_financiamiento_select');
+    if (!$sel.length || typeof $.fn.select2 !== 'function') return;
+    if ($sel.hasClass('select2-hidden-accessible')) {
+        $sel.select2('destroy');
+    }
+}
+
+function initClienteFinanciamientoSelect2() {
+    var $sel = $('#cliente_financiamiento_select');
+    if (!$sel.length || typeof $.fn.select2 !== 'function') return;
+    destruirClienteFinanciamientoSelect2();
+    $sel.select2({
+        theme: 'bootstrap-5',
+        width: '100%',
+        dropdownParent: $('#solicitudModal'),
+        placeholder: $sel.data('placeholder') || 'Seleccionar cliente...',
+        allowClear: true,
+        minimumResultsForSearch: 8,
+        language: {
+            noResults: function() { return 'Sin coincidencias'; },
+            searching: function() { return 'Buscando…'; }
+        }
+    });
+}
+
+var ultimoFinanciamientoRegistroCargado = null;
+
+function cargarRegistroFinanciamientoYPrefill(id) {
+    var sid = String(id || '').trim();
+    if (!sid) return;
+    $('#financiamiento_registro_id').val(sid);
+    if (ultimoFinanciamientoRegistroCargado === sid) {
+        return;
+    }
+    ultimoFinanciamientoRegistroCargado = sid;
+    $.get('api/sol_financiamiento.php', { id: sid }, function(res) {
+        if (res.success && res.data) prefillFormularioDesdeFinanciamiento(res.data);
+        else mostrarAlerta('No se pudo cargar el registro.', 'danger');
+    }).fail(function() {
+        mostrarAlerta('Error al cargar el registro.', 'danger');
+    });
+}
+
+function cargarClientesFinanciamientoSelect() {
+    destruirClienteFinanciamientoSelect2();
+    ultimoFinanciamientoRegistroCargado = null;
+    var $sel = $('#cliente_financiamiento_select');
+    $sel.empty().append($('<option></option>').val('').text('Cargando clientes...'));
+    var params = { limite: 500 };
+    var sid = $('#solicitud_id').val();
+    if (sid) {
+        params.solicitud_id = sid;
+    }
+    $.get('api/sol_financiamiento.php', params, function(res) {
+        if (!res.success || !Array.isArray(res.data)) {
+            $sel.empty().append($('<option></option>').val('').text('No se pudo cargar el listado'));
+            initClienteFinanciamientoSelect2();
+            return;
+        }
+        $sel.empty();
+        $sel.append($('<option></option>').val('').text('Seleccionar cliente...'));
+        res.data.forEach(function(item) {
+            var nAdj = parseInt(item.adjuntos_count, 10);
+            if (isNaN(nAdj) || nAdj < 0) {
+                nAdj = 0;
+            }
+            var vendedor = item.nombre_gestor || item.email_vendedor || '';
+            var cliente = [item.cliente_nombre, item.cliente_id, item.cliente_correo].filter(Boolean).join(' — ');
+            var texto = [vendedor ? ('Vendedor: ' + vendedor) : '', cliente].filter(Boolean).join(' | ')
+                + ' — adjuntos (' + nAdj + ')';
+            $sel.append($('<option></option>').val(String(item.id)).text(texto));
+        });
+        var vinc = String($('#financiamiento_registro_id').val() || '').trim();
+        if (vinc && /^\d+$/.test(vinc) && $sel.find('option[value="' + vinc + '"]').length) {
+            $sel.val(vinc);
+        } else {
+            $sel.val('');
+        }
+        initClienteFinanciamientoSelect2();
+        $sel.trigger('change.select2');
+    }).fail(function() {
+        $sel.empty().append($('<option></option>').val('').text('No se pudieron cargar clientes'));
+        initClienteFinanciamientoSelect2();
+    });
+}
+
+function escapeHtml(s) {
+    if (!s) return '';
+    var div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+}
+
+/**
+ * Rellena Ejecutivo de ventas desde id_vendedor o email_vendedor en financiamiento_registros.
+ * Prioridad: id en catálogo; si no hay match, búsqueda por email (data-email o texto del option).
+ */
+function aplicarEjecutivoVentaDesdeFinanciamiento(d) {
+    if (!d) {
+        return;
+    }
+    var $sel = $('#ejecutivo_ventas_id');
+    var $inp = $('#buscar_ejecutivo');
+    if (!$sel.length) {
+        return;
+    }
+    var idRaw = d.id_vendedor;
+    if (idRaw !== null && idRaw !== undefined && idRaw !== '') {
+        var idV = parseInt(String(idRaw), 10);
+        if (!isNaN(idV) && idV > 0) {
+            var $opt = $sel.find('option[value="' + String(idV) + '"]');
+            if ($opt.length) {
+                $sel.val(String(idV));
+                if ($inp.length) {
+                    $inp.val($opt.first().text().trim());
+                }
+                return;
+            }
+        }
+    }
+    var em = d.email_vendedor;
+    if (em === null || em === undefined) {
+        return;
+    }
+    em = String(em).trim();
+    if (!em) {
+        return;
+    }
+    var emLower = em.toLowerCase();
+    var $match = null;
+    $sel.find('option').each(function() {
+        if (!this.value) {
+            return;
+        }
+        var $o = $(this);
+        var de = ($o.attr('data-email') || '').toString().trim().toLowerCase();
+        if (de && de === emLower) {
+            $match = $o;
+            return false;
+        }
+    });
+    if (!$match || !$match.length) {
+        $sel.find('option').each(function() {
+            if (!this.value) {
+                return;
+            }
+            if ($(this).text().toLowerCase().indexOf(emLower) !== -1) {
+                $match = $(this);
+                return false;
+            }
+        });
+    }
+    if ($match && $match.length && $match.val()) {
+        $sel.val($match.val());
+        if ($inp.length) {
+            $inp.val($match.text().trim());
+        }
+    }
+}
+
+function prefillFormularioDesdeFinanciamiento(d) {
+    if (!d) return;
+    function set(id, val) {
+        if (val === null || val === undefined) return;
+        var v = String(val).trim();
+        var $el = $('#' + id);
+        if ($el.length === 0) return;
+        if ($el.is('input[type="checkbox"]')) {
+            $el.prop('checked', v === '1' || v === 1 || v === true);
+        } else {
+            $el.val(v);
+        }
+    }
+    set('nombre_cliente', d.cliente_nombre);
+    set('cedula', d.cliente_id);
+    set('edad', d.cliente_edad);
+    set('genero', d.cliente_sexo === 'M' || d.cliente_sexo === 'Masculino' ? 'Masculino' : (d.cliente_sexo === 'F' || d.cliente_sexo === 'Femenino' ? 'Femenino' : d.cliente_sexo));
+    set('telefono', d.celular_cliente || d.tel_residencia);
+    set('email', d.cliente_correo);
+    set('casado', d.tiene_conyuge);
+    set('hijos', d.cliente_dependientes);
+    set('direccion', d.direccion || [d.prov_dist_corr, d.barriada_calle_casa].filter(Boolean).join(' '));
+    if (d.barriada) {
+        set('barriada', d.barriada);
+    } else if (d.barriada_calle_casa) {
+        var partesBarriada = String(d.barriada_calle_casa).split(' - ');
+        if (partesBarriada.length) set('barriada', partesBarriada[0].trim());
+    }
+    if (d.casa_edif) {
+        set('casa_edif', d.casa_edif);
+    } else if (d.edificio_apto) {
+        var partesCasa = String(d.edificio_apto).split(',');
+        if (partesCasa.length >= 1) set('casa_edif', partesCasa[0].trim());
+        if (partesCasa.length >= 2) set('numero_casa_apto', partesCasa.slice(1).join(',').trim());
+    }
+    if (d.numero_casa_apto) set('numero_casa_apto', d.numero_casa_apto);
+    set('ingreso', d.empresa_salario);
+    set('tiempo_laborar', d.empresa_anios);
+    set('profesion', d.empresa_ocupacion);
+    set('ocupacion', d.empresa_ocupacion);
+    set('nombre_empresa_negocio', d.empresa_nombre);
+    set('continuidad_laboral', d.trabajo_anterior);
+    set('comentarios_gestor', d.comentarios_gestor);
+    if (d.prov_dist_corr) {
+        var partes = String(d.prov_dist_corr).split(/[,\/]/).map(function(p) { return p.trim(); }).filter(Boolean);
+        if (partes.length >= 1) set('provincia', partes[0]);
+        if (partes.length >= 2) set('distrito', partes[1]);
+        if (partes.length >= 3) set('corregimiento', partes[2]);
+    }
+    if (d.marca_auto || d.modelo_auto || d.precio_venta || d.anio_auto) {
+        vehiculosList = [{
+            id: null,
+            marca: d.marca_auto || '',
+            modelo: d.modelo_auto || '',
+            anio: d.anio_auto || '',
+            kilometraje: d.kms_cod_auto || '',
+            precio: d.precio_venta || '',
+            abono_porcentaje: '',
+            abono_monto: d.abono || ''
+        }];
+        sincronizarAbonosVehiculosLista();
+        renderizarVehiculos();
+    }
+    aplicarEjecutivoVentaDesdeFinanciamiento(d);
+    mostrarAlerta('Datos cargados desde Sol Financiamiento. Revise y complete los campos que falten.', 'success');
+}
+
+// Función para abrir modal de adjuntos
+window.abrirModalAdjuntos = function abrirModalAdjuntos() {
+    const solicitudId = $('#solicitud_id').val();
+    
+    if (!solicitudId) {
+        mostrarAlerta('Debe guardar la solicitud antes de gestionar adjuntos', 'warning');
+        return;
+    }
+    
+    // Configurar el ID de solicitud para adjuntos
+    $('#adjunto_solicitud_id').val(solicitudId);
+    $('#corredor_solicitud_id').val(solicitudId);
+    
+    // Cargar información de la solicitud
+    cargarInfoSolicitudAdjuntos(solicitudId);
+    
+    // Cargar adjuntos existentes
+    cargarAdjuntos(solicitudId);
+    if (typeof cargarEnviosCorredor === 'function') {
+        cargarEnviosCorredor(solicitudId);
+    }
+    
+    // Mostrar modal
+    $('#adjuntosModal').modal('show');
+};
+
+// Función para abrir modal de adjuntos desde la tabla
+window.abrirModalAdjuntosDesdeTabla = function abrirModalAdjuntosDesdeTabla(solicitudId) {
+    // Configurar el ID de solicitud para adjuntos
+    $('#adjunto_solicitud_id').val(solicitudId);
+    $('#corredor_solicitud_id').val(solicitudId);
+    
+    // Cargar información de la solicitud
+    cargarInfoSolicitudAdjuntos(solicitudId);
+    
+    // Cargar adjuntos existentes
+    cargarAdjuntos(solicitudId);
+    if (typeof cargarEnviosCorredor === 'function') {
+        cargarEnviosCorredor(solicitudId);
+    }
+    
+    // Mostrar modal
+    $('#adjuntosModal').modal('show');
+};
+
+// Función para cargar información de la solicitud en el modal de adjuntos
+function cargarInfoSolicitudAdjuntos(solicitudId) {
+    $.ajax({
+        url: 'api/solicitudes.php',
+        type: 'GET',
+        data: { id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                const solicitud = response.data;
+                const infoHtml = `
+                    <div class="col-md-12">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6 class="card-title">
+                                    <i class="fas fa-file-alt me-2"></i>Solicitud #${solicitud.id}
+                                </h6>
+                                <p class="card-text mb-1">
+                                    <strong>Cliente:</strong> ${solicitud.nombre_cliente}
+                                </p>
+                                <p class="card-text mb-1">
+                                    <strong>Cédula:</strong> ${solicitud.cedula}
+                                </p>
+                                <p class="card-text mb-0">
+                                    <strong>Estado:</strong> <span class="badge bg-primary">${solicitud.estado}</span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                $('#adjuntosSolicitudInfo').html(infoHtml);
+            }
+        },
+        error: function() {
+            $('#adjuntosSolicitudInfo').html('<div class="col-md-12"><div class="alert alert-warning">Error al cargar información de la solicitud</div></div>');
+        }
+    });
+}
+
+// Evitar doble envío mientras se guarda
+var guardarSolicitudEnCurso = false;
+
+// Función para guardar solicitud
+function guardarSolicitud() {
+    if (guardarSolicitudEnCurso) {
+        console.log('Guardado ya en curso, ignorando doble clic');
+        return;
+    }
+    guardarSolicitudEnCurso = true;
+    console.log('=== GUARDANDO SOLICITUD ===');
+    
+    // Verificar que el formulario existe
+    const form = $('#solicitudForm');
+    if (form.length === 0) {
+        console.error('❌ ERROR: El formulario #solicitudForm no existe');
+        mostrarAlerta('Error: El formulario no se encuentra', 'danger');
+        return;
+    }
+    
+    // FormData con lo que realmente se enviará (validamos esto para evitar desfase con el DOM)
+    const formData = new FormData(form[0]);
+    
+    const camposRequeridos = {
+        'tipo_persona': 'Tipo de Persona',
+        'nombre_cliente': 'Nombre del Cliente',
+        'cedula': '# de Cédula',
+        'perfil_financiero': 'Perfil Financiero'
+    };
+    
+    let camposFaltantes = [];
+    for (let campo in camposRequeridos) {
+        const valor = formData.get(campo);
+        const str = (valor != null && typeof valor === 'string') ? valor.trim() : '';
+        if (!str) {
+            camposFaltantes.push(camposRequeridos[campo]);
+        }
+    }
+    
+    if (camposFaltantes.length > 0) {
+        guardarSolicitudEnCurso = false;
+        console.error('❌ ERROR: Campos requeridos faltantes:', camposFaltantes);
+        mostrarAlerta('Por favor, complete los siguientes campos requeridos:\n\n• ' + camposFaltantes.join('\n• '), 'warning');
+        
+        for (let campo in camposRequeridos) {
+            const valor = formData.get(campo);
+            const str = (valor != null && typeof valor === 'string') ? valor.trim() : '';
+            if (!str) $(`#${campo}`).addClass('is-invalid');
+        }
+        setTimeout(function() {
+            for (let c in camposRequeridos) { $(`#${c}`).removeClass('is-invalid'); }
+        }, 3000);
+        
+        const primerCampo = Object.keys(camposRequeridos).find(function(campo) {
+            const v = formData.get(campo);
+            return !(v != null && typeof v === 'string' && v.trim() !== '');
+        });
+        if (primerCampo) {
+            $(`#${primerCampo}`).focus();
+            $('html, body').animate({ scrollTop: $(`#${primerCampo}`).offset().top - 100 }, 500);
+        }
+        return;
+    }
+    
+    // Validar que el formulario sea válido (HTML5 validation)
+    if (!form[0].checkValidity()) {
+        guardarSolicitudEnCurso = false;
+        console.error('❌ ERROR: El formulario no es válido (validación HTML5)');
+        form[0].reportValidity();
+        return;
+    }
+    const solicitudId = $('#solicitud_id').val();
+    
+    console.log('Solicitud ID:', solicitudId);
+    console.log('FormData contents:');
+    for (let [key, value] of formData.entries()) {
+        console.log(key, value);
+    }
+    
+    // Usar POST para ambos casos, con parámetro adicional para actualización
+    const method = 'POST';
+    if (solicitudId) {
+        formData.append('_method', 'PUT');
+    }
+    console.log('Método:', method);
+    
+    // Mostrar indicador de carga
+    const submitButton = form.find('button[type="submit"]');
+    const originalText = submitButton.html();
+    submitButton.prop('disabled', true).html('<i class="fas fa-spinner fa-spin me-2"></i>Guardando...');
+    
+    $.ajax({
+        url: 'api/solicitudes.php',
+        type: method,
+        data: formData,
+        processData: false,
+        contentType: false,
+        dataType: 'json',
+        success: function(response) {
+            guardarSolicitudEnCurso = false;
+            console.log('✅ Respuesta del servidor:', response);
+            submitButton.prop('disabled', false).html(originalText);
+            
+            if (response.success) {
+                const nuevaSolicitudId = response.data && response.data.id ? response.data.id : solicitudId;
+                
+                // Guardar vehículos
+                if (nuevaSolicitudId && vehiculosList.length > 0) {
+                    guardarVehiculos(nuevaSolicitudId);
+                } else {
+                    mostrarAlertaFinGuardado(solicitudId, nuevaSolicitudId);
+                }
+            } else {
+                let msg = 'Error al guardar solicitud: ' + (response.message || 'Error desconocido');
+                if (response.error_detail) msg += '\n\nDetalle: ' + response.error_detail;
+                mostrarAlerta(msg, 'danger');
+            }
+        },
+        error: function(xhr, status, error) {
+            guardarSolicitudEnCurso = false;
+            console.error('❌ ERROR AJAX:', error);
+            console.error('Status:', status);
+            console.error('Response:', xhr.responseText);
+            submitButton.prop('disabled', false).html(originalText);
+            
+            let mensaje = 'Error de conexión al guardar solicitud';
+            try {
+                const errorResponse = JSON.parse(xhr.responseText);
+                if (errorResponse.message) mensaje = errorResponse.message;
+                if (errorResponse.error_detail) mensaje += '\n\nDetalle: ' + errorResponse.error_detail;
+            } catch (e) {
+                // Si no se puede parsear, usar el mensaje por defecto
+            }
+            mostrarAlerta(mensaje, 'danger');
+        }
+    });
+}
+
+// Función para ver detalles
+function verDetalles(id) {
+    mostrarDetalles(id);
+}
+
+// Función para mostrar detalles en modal (zona en construcción)
+function mostrarDetalles(solicitudOrId) {
+    var solicitudId = typeof solicitudOrId === 'object' && solicitudOrId
+        ? (solicitudOrId.id || '')
+        : (solicitudOrId || '');
+
+    var contenido = `
+        <div class="text-center py-4 px-3" style="background: linear-gradient(180deg, #fff8ef 0%, #ffffff 70%); border-radius: 12px;">
+            <div class="mb-3" aria-hidden="true">
+                <i class="fas fa-hard-hat text-warning" style="font-size: 3.5rem;"></i>
+                <i class="fas fa-tools text-secondary mx-3" style="font-size: 2.4rem;"></i>
+                <i class="fas fa-exclamation-triangle text-danger" style="font-size: 2.8rem;"></i>
+            </div>
+            <div class="mb-3">
+                <span class="badge rounded-pill text-bg-warning px-3 py-2">
+                    <i class="fas fa-hard-hat me-2"></i>Zona en construcción
+                </span>
+            </div>
+            <h4 class="fw-bold mb-2" style="color:#d35400;">Zona en construcción</h4>
+            <p class="text-muted mb-3 mx-auto" style="max-width: 460px;">
+                Esta vista de <strong>Detalles de la Solicitud</strong> está en desarrollo.
+                Pronto podrá consultar aquí la información completa de la solicitud.
+            </p>
+            <div class="d-flex justify-content-center gap-3 mb-3 flex-wrap" aria-hidden="true">
+                <div class="border rounded-3 bg-white px-3 py-2 shadow-sm">
+                    <i class="fas fa-file-alt text-primary fa-lg"></i>
+                </div>
+                <div class="border rounded-3 bg-white px-3 py-2 shadow-sm">
+                    <i class="fas fa-car text-success fa-lg"></i>
+                </div>
+                <div class="border rounded-3 bg-white px-3 py-2 shadow-sm">
+                    <i class="fas fa-user-check text-info fa-lg"></i>
+                </div>
+                <div class="border rounded-3 bg-white px-3 py-2 shadow-sm">
+                    <i class="fas fa-clipboard-list text-secondary fa-lg"></i>
+                </div>
+            </div>
+            ${solicitudId ? '<p class="small text-muted mb-0">Solicitud #' + solicitudId + '</p>' : ''}
+        </div>
+    `;
+
+    $('#detallesContent').html(contenido);
+    $('#detallesModal').modal('show');
+}
+
+// Función para editar solicitud
+function editarSolicitud(id) {
+    console.log('=== EDITANDO SOLICITUD ===');
+    console.log('ID recibido:', id);
+    
+    $.ajax({
+        url: 'api/solicitudes.php',
+        type: 'GET',
+        data: { id: id },
+        dataType: 'json',
+        success: function(response) {
+            console.log('=== RESPUESTA AJAX EDITAR ===');
+            console.log('Response completa:', response);
+            if (response.success) {
+                console.log('Datos de solicitud:', response.data);
+                llenarFormularioEdicion(response.data);
+            } else {
+                console.error('Error en respuesta:', response.message);
+                mostrarAlerta('Error al cargar solicitud: ' + response.message, 'danger');
+            }
+        },
+        error: function() {
+            mostrarAlerta('Error de conexión al cargar solicitud', 'danger');
+        }
+    });
+}
+
+// Función para llenar formulario de edición
+function llenarFormularioEdicion(solicitud) {
+    console.log('=== LLENANDO FORMULARIO DE EDICIÓN ===');
+    console.log('Solicitud recibida:', solicitud);
+    console.log('ID de solicitud:', solicitud.id);
+    
+    // Llenar campos básicos
+    $('#solicitud_id').val(solicitud.id);
+    var finId = solicitud.financiamiento_registro_id;
+    $('#financiamiento_registro_id').val(
+        finId !== undefined && finId !== null && String(finId).trim() !== '' ? String(finId).trim() : ''
+    );
+    $('#tipo_persona').val(solicitud.tipo_persona);
+    $('#nombre_cliente').val(solicitud.nombre_cliente);
+    $('#cedula').val(solicitud.cedula);
+    $('#edad').val(solicitud.edad);
+    $('#genero').val(solicitud.genero);
+          $('#telefono').val(solicitud.telefono);
+      $('#email').val(solicitud.email);
+      $('#email_pipedrive').val(solicitud.email_pipedrive);
+      $('#casado').prop('checked', solicitud.casado == 1);
+    $('#hijos').val(solicitud.hijos);
+    
+    // Dirección
+    $('#provincia').val(solicitud.provincia);
+    $('#distrito').val(solicitud.distrito);
+    $('#corregimiento').val(solicitud.corregimiento);
+    $('#barriada').val(solicitud.barriada);
+    $('#casa_edif').val(solicitud.casa_edif);
+    $('#numero_casa_apto').val(solicitud.numero_casa_apto);
+    $('#direccion').val(solicitud.direccion);
+    
+          // Perfil financiero
+      $('#perfil_financiero').val(solicitud.perfil_financiero);
+      $('#ingreso').val(solicitud.ingreso);
+      $('#tiempo_laborar').val(solicitud.tiempo_laborar);
+      $('#profesion').val(solicitud.profesion);
+      $('#ocupacion').val(solicitud.ocupacion);
+      $('#nombre_empresa_negocio').val(solicitud.nombre_empresa_negocio);
+    // Limpiar fechas inválidas
+    if (solicitud.estabilidad_laboral && solicitud.estabilidad_laboral !== '0000-00-00' && solicitud.estabilidad_laboral !== '-') {
+        $('#estabilidad_laboral').val(solicitud.estabilidad_laboral);
+    } else {
+        $('#estabilidad_laboral').val('');
+    }
+    
+          if (solicitud.fecha_constitucion && solicitud.fecha_constitucion !== '0000-00-00' && solicitud.fecha_constitucion !== '-') {
+          $('#fecha_constitucion').val(solicitud.fecha_constitucion);
+      } else {
+          $('#fecha_constitucion').val('');
+      }
+      
+      $('#continuidad_laboral').val(solicitud.continuidad_laboral);
+      
+      // Datos del auto
+    $('#marca_auto').val(solicitud.marca_auto);
+    $('#modelo_auto').val(solicitud.modelo_auto);
+    $('#año_auto').val(solicitud.año_auto);
+    $('#kilometraje').val(solicitud.kilometraje);
+    $('#precio_especial').val(solicitud.precio_especial);
+    $('#abono_porcentaje').val(solicitud.abono_porcentaje);
+    $('#abono_monto').val(solicitud.abono_monto);
+    
+    // Comentarios / Análisis
+    $('#score_apc').val(solicitud.score_apc != null && solicitud.score_apc !== '' ? solicitud.score_apc : '');
+    $('#comentarios_gestor').val(solicitud.comentarios_gestor);
+    $('#contador_comentarios').text(1000 - (solicitud.comentarios_gestor || '').length);
+    
+    // Asignaciones
+    $('#banco_id').val(solicitud.banco_id || '');
+    $('#vendedor_id').val(solicitud.vendedor_id || '');
+
+    // Ejecutivo de ventas
+    if (typeof solicitud.ejecutivo_ventas_id !== 'undefined' && solicitud.ejecutivo_ventas_id !== null) {
+        var idEj = String(solicitud.ejecutivo_ventas_id);
+        $('#ejecutivo_ventas_id').val(idEj);
+        var optEj = $('#ejecutivo_ventas_id option[value=\"' + idEj.replace(/\"/g, '\\\"') + '\"]');
+        if (optEj.length > 0) {
+            $('#buscar_ejecutivo').val(optEj.text().trim());
+        } else {
+            $('#buscar_ejecutivo').val('');
+        }
+    } else {
+        $('#ejecutivo_ventas_id').val('');
+        $('#buscar_ejecutivo').val('');
+    }
+    
+    // Cambiar título del modal
+    $('#solicitudModalLabel').html('<i class="fas fa-edit me-2"></i>Editar Solicitud de Crédito');
+    
+    // Configurar adjuntos ANTES de mostrar el modal
+    // El modal de adjuntos se abrirá independientemente
+    
+    // Inicializar usuarios banco
+    inicializarUsuariosBanco(solicitud.id);
+    
+    // Cargar vehículos
+    cargarVehiculos(solicitud.id);
+    
+    // Deshabilitar campos si el usuario es banco
+    if (window.userRoles && window.userRoles.isBanco) {
+        deshabilitarCamposParaBanco();
+    }
+    
+    // Verificar si hay evaluación seleccionada para mostrar/ocultar pestaña "Cita y Firma"
+    verificarEvaluacionSeleccionada(solicitud.id);
+
+    cargarClientesFinanciamientoSelect();
+
+    // Mostrar modal
+    $('#solicitudModal').modal('show');
+}
+
+// Formato auxiliar muro
+function muroFmtMoney(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = parseFloat(v);
+    if (!isFinite(n)) return '—';
+    return '$' + n.toLocaleString('es-PA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function muroFmtDecision(d) {
+    if (!d) return '—';
+    return String(d).toUpperCase().replace(/_/g, ' ');
+}
+
+function muroEsc(s) {
+    if (s == null || s === '') return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function htmlDatosAutoVehiculo(vehiculo, titulo) {
+    if (!vehiculo) {
+        return '<p class="text-muted mb-0">Sin vehículo</p>';
+    }
+    var apartadoBadge = parseInt(vehiculo.apartado, 10) === 1
+        ? ' <span class="badge bg-warning text-dark">Apartado</span>'
+        : '';
+    return `
+        <div class="row g-2">
+            <div class="col-md-4"><strong>Unidad:</strong> ${muroEsc(vehiculo.unidad || '—')}${apartadoBadge}</div>
+            <div class="col-md-4"><strong>Marca:</strong> ${muroEsc(vehiculo.marca || '—')}</div>
+            <div class="col-md-4"><strong>Modelo:</strong> ${muroEsc(vehiculo.modelo || '—')}</div>
+            <div class="col-md-4"><strong>Año:</strong> ${muroEsc(vehiculo.anio || '—')}</div>
+            <div class="col-md-4"><strong>Kilometraje:</strong> ${muroEsc(vehiculo.kilometraje || '—')}</div>
+            <div class="col-md-4"><strong>Precio:</strong> ${muroFmtMoney(vehiculo.precio)}</div>
+            <div class="col-md-4"><strong>Abono (%):</strong> ${vehiculo.abono_porcentaje != null && vehiculo.abono_porcentaje !== '' ? muroEsc(vehiculo.abono_porcentaje) + '%' : '—'}</div>
+            <div class="col-md-4"><strong>Monto abono:</strong> ${muroFmtMoney(vehiculo.abono_monto)}</div>
+        </div>
+    `;
+}
+
+function htmlTarjetaVehiculoApartado(vehiculos) {
+    var list = Array.isArray(vehiculos) ? vehiculos : [];
+    var apartado = null;
+    for (var i = 0; i < list.length; i++) {
+        if (parseInt(list[i].apartado, 10) === 1) {
+            apartado = list[i];
+            break;
+        }
+    }
+    if (!apartado) {
+        return '<p class="text-muted mb-0">No hay vehículo apartado en esta solicitud.</p>';
+    }
+    return htmlDatosAutoVehiculo(apartado);
+}
+
+function htmlRespuestaBancoCard(evaluacion, bancoLabel) {
+    if (!evaluacion) {
+        return '<div class="alert alert-secondary mb-0 py-2 small">Este agente aún no ha registrado respuesta (martillo / evaluación).</div>';
+    }
+    var veh = [evaluacion.vehiculo_marca, evaluacion.vehiculo_modelo, evaluacion.vehiculo_anio]
+        .filter(Boolean).join(' ').trim() || '—';
+    var fecha = evaluacion.fecha_evaluacion
+        ? new Date(String(evaluacion.fecha_evaluacion).replace(' ', 'T')).toLocaleString('es-PA')
+        : '—';
+    return `
+        <div class="card border-info mb-3">
+            <div class="card-header bg-info text-white py-2">
+                <h6 class="mb-0"><i class="fas fa-gavel me-2"></i>Respuesta del banco${bancoLabel ? ': ' + muroEsc(bancoLabel) : ''}</h6>
+            </div>
+            <div class="card-body py-2">
+                <div class="row g-2 small">
+                    <div class="col-md-4"><strong>Fecha:</strong> ${muroEsc(fecha)}</div>
+                    <div class="col-md-4"><strong>Decisión:</strong> <span class="badge bg-primary">${muroEsc(muroFmtDecision(evaluacion.decision))}</span></div>
+                    <div class="col-md-8"><strong>Razón:</strong> ${muroEsc(evaluacion.razon || '—')}</div>
+                    <div class="col-md-4"><strong>Tasa:</strong> ${evaluacion.tasa_bancaria != null && evaluacion.tasa_bancaria !== '' ? muroEsc(parseFloat(evaluacion.tasa_bancaria).toFixed(2)) + '%' : '—'}</div>
+                    <div class="col-md-4"><strong>Vehículo evaluado:</strong> ${muroEsc(veh)}</div>
+                    <div class="col-md-4"><strong>Valor a financiar:</strong> ${muroFmtMoney(evaluacion.valor_financiar)}</div>
+                    <div class="col-md-4"><strong>Abono:</strong> ${muroFmtMoney(evaluacion.abono)}</div>
+                    <div class="col-md-4"><strong>Plazo:</strong> ${evaluacion.plazo ? muroEsc(evaluacion.plazo) + ' meses' : '—'}</div>
+                    <div class="col-md-4"><strong>Letra mensual:</strong> ${muroFmtMoney(evaluacion.letra)}</div>
+                    <div class="col-md-4"><strong>Letra quincenal:</strong> ${muroFmtMoney(evaluacion.letra_quincenal)}</div>
+                    <div class="col-md-4"><strong>Promoción:</strong> ${muroEsc(evaluacion.promocion || '—')}</div>
+                    <div class="col-md-4"><strong>Cuantía:</strong> ${muroFmtMoney(evaluacion.cuantia)}</div>
+                    <div class="col-12"><strong>Comentarios:</strong> ${muroEsc(evaluacion.comentarios || '—')}</div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function cargarRespuestasBancoEnMuro(solicitudId, ubsId, containerSelector, bancoLabel) {
+    var $box = $(containerSelector);
+    if (!$box.length) return;
+    $box.html('<p class="text-muted small mb-0"><i class="fas fa-spinner fa-spin me-1"></i>Cargando respuesta del banco...</p>');
+    $.ajax({
+        url: 'api/evaluaciones_banco.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json'
+    }).done(function (res) {
+        if (!res || !res.success) {
+            $box.html('<div class="alert alert-warning mb-0 py-2 small">No se pudieron cargar las respuestas del banco.</div>');
+            return;
+        }
+        var rows = Array.isArray(res.data) ? res.data : [];
+        // evaluaciones_banco.usuario_banco_id = id de usuarios_banco_solicitudes
+        var propias = rows.filter(function (e) {
+            return String(e.usuario_banco_id) === String(ubsId);
+        });
+        if (!propias.length) {
+            $box.html(htmlRespuestaBancoCard(null, bancoLabel));
+            return;
+        }
+        // Mostrar la más reciente primero (API ya ordena DESC)
+        var html = '';
+        propias.forEach(function (ev) {
+            html += htmlRespuestaBancoCard(ev, bancoLabel);
+        });
+        $box.html(html);
+    }).fail(function () {
+        $box.html('<div class="alert alert-danger mb-0 py-2 small">Error al cargar respuestas del banco.</div>');
+    });
+}
+
+// Función para ver muro de comunicación
+function verMuro(id) {
+    // Cargar información de la solicitud
+    cargarInfoSolicitud(id);
+    
+    // Cargar vehículos y usuarios banco para crear las pestañas
+    cargarMuroCompleto(id);
+    
+    // Mostrar modal
+    $('#muroModal').modal('show');
+}
+
+// Función para cargar el muro completo con vehículos y usuarios banco
+function cargarMuroCompleto(solicitudId) {
+    // Cargar vehículos
+    $.ajax({
+        url: 'api/vehiculos_solicitud.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(responseVehiculos) {
+            const vehiculos = responseVehiculos.success ? responseVehiculos.data : [];
+            
+                          // Cargar usuarios banco
+              $.ajax({
+                  url: 'api/usuarios_banco_solicitudes.php',
+                  type: 'GET',
+                  data: { solicitud_id: solicitudId },
+                  dataType: 'json',
+                  success: function(responseUsuarios) {
+                      let usuariosBanco = responseUsuarios.success ? responseUsuarios.data : [];
+                      
+                      // Analista banco: solo su pestaña. Admin banco: usuarios de su entidad.
+                      if (window.userRoles && window.userRoles.isBanco && 
+                          !window.userRoles.isAdmin && !window.userRoles.isGestor && 
+                          window.userId) {
+                          if (window.userRoles.isAdminBanco && window.userBancoId) {
+                              usuariosBanco = usuariosBanco.filter(function(usuario) {
+                                  return String(usuario.banco_id) === String(window.userBancoId);
+                              });
+                          } else if (!window.userRoles.isAdminBanco) {
+                              usuariosBanco = usuariosBanco.filter(function(usuario) {
+                                  return usuario.usuario_banco_id == window.userId;
+                              });
+                          }
+                      }
+                      
+                      // Generar estructura de pestañas
+                      generarPestanasMuro(solicitudId, vehiculos, usuariosBanco);
+                  },
+                error: function() {
+                    console.error('Error al cargar usuarios banco');
+                    generarPestanasMuro(solicitudId, vehiculos, []);
+                }
+            });
+        },
+        error: function() {
+            console.error('Error al cargar vehículos');
+            generarPestanasMuro(solicitudId, [], []);
+        }
+    });
+}
+
+// Función para generar las pestañas del muro
+function generarPestanasMuro(solicitudId, vehiculos, usuariosBanco) {
+    const tabsContainer = $('#vehiculosTabs');
+    const contentContainer = $('#vehiculosTabContent');
+    
+    tabsContainer.empty();
+    contentContainer.empty();
+    
+    // Si no hay vehículos, mostrar un tab general
+    if (vehiculos.length === 0) {
+        const tabHtml = `
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#general" type="button">
+                    <i class="fas fa-car me-2"></i>General
+                </button>
+            </li>
+        `;
+        tabsContainer.html(tabHtml);
+        
+        generarContenidoTab(solicitudId, 'general', null, usuariosBanco, true);
+        
+        // Cargar notas del primer tab
+        cargarNotasPrimerTab();
+        return;
+    }
+    
+    // Generar un tab por cada vehículo
+    vehiculos.forEach((vehiculo, index) => {
+        const activo = index === 0 ? 'active' : '';
+        const vehId = `vehiculo_${vehiculo.id || index}`;
+        
+        const tabHtml = `
+            <li class="nav-item" role="presentation">
+                <button class="nav-link ${activo}" data-bs-toggle="tab" data-bs-target="#${vehId}" type="button">
+                    <i class="fas fa-car me-2"></i>${vehiculo.marca || 'Sin marca'} ${vehiculo.modelo || ''} (${vehiculo.anio || 'N/A'})
+                </button>
+            </li>
+        `;
+        tabsContainer.append(tabHtml);
+        
+        // Generar contenido del tab (pasar si es el primero para la clase activo)
+        generarContenidoTab(solicitudId, vehId, vehiculo, usuariosBanco, index === 0);
+    });
+    
+    // Cargar notas del primer tab
+    cargarNotasPrimerTab();
+}
+
+// Función para generar el contenido de un tab
+function generarContenidoTab(solicitudId, tabId, vehiculo, usuariosBanco, isFirst = false) {
+    const activo = isFirst ? 'show active' : '';
+    
+    let contenidoHTML = `
+        <div class="tab-pane fade ${activo}" id="${tabId}" role="tabpanel">
+            <div class="mt-3">
+                ${vehiculo ? `
+                    <div class="card mb-4">
+                        <div class="card-header bg-success text-white">
+                            <h6 class="mb-0"><i class="fas fa-car me-2"></i>Datos del auto</h6>
+                        </div>
+                        <div class="card-body">
+                            ${htmlDatosAutoVehiculo(vehiculo)}
+                        </div>
+                    </div>
+                ` : ''}
+    `;
+    
+    // Si no hay usuarios banco, mostrar solo comentarios generales
+    if (usuariosBanco.length === 0) {
+        contenidoHTML += generarSeccionNotasAcordeon(solicitudId, null, vehiculo ? vehiculo.id : null);
+    } else {
+        // Generar sub-pestañas para cada usuario banco
+        contenidoHTML += `
+                <ul class="nav nav-pills mb-3" id="usuariosTab_${tabId}" role="tablist">
+        `;
+        
+        usuariosBanco.forEach((usuario, index) => {
+            const activoUsuario = index === 0 ? 'active' : '';
+            const usuarioId = `usuario_${usuario.id}`;
+            const bancoTxt = usuario.banco_nombre ? ` · ${usuario.banco_nombre}` : '';
+            
+            contenidoHTML += `
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link ${activoUsuario}" data-bs-toggle="tab" data-bs-target="#${tabId}_${usuarioId}" type="button">
+                            ${muroEsc(usuario.usuario_nombre || '')} ${muroEsc(usuario.usuario_apellido || '')}${muroEsc(bancoTxt)}
+                        </button>
+                    </li>
+            `;
+        });
+        
+        contenidoHTML += `
+                </ul>
+                <div class="tab-content" id="usuariosContent_${tabId}">
+        `;
+        
+        usuariosBanco.forEach((usuario, index) => {
+            const activoUsuario = index === 0 ? 'show active' : '';
+            const usuarioId = `usuario_${usuario.id}`;
+            const respBoxId = `resp_banco_${tabId}_${usuario.id}`;
+            const bancoLabel = [usuario.banco_nombre, ((usuario.usuario_nombre || '') + ' ' + (usuario.usuario_apellido || '')).trim()]
+                .filter(Boolean).join(' — ');
+            
+            contenidoHTML += `
+                    <div class="tab-pane fade ${activoUsuario}" id="${tabId}_${usuarioId}" role="tabpanel">
+                        <div id="${respBoxId}" class="mb-3" data-ubs-id="${usuario.id}" data-banco-label="${muroEsc(bancoLabel)}" data-solicitud="${solicitudId}">
+                            <p class="text-muted small mb-0"><i class="fas fa-spinner fa-spin me-1"></i>Cargando respuesta del banco...</p>
+                        </div>
+            `;
+            
+            contenidoHTML += generarSeccionNotasAcordeon(solicitudId, usuario.id, vehiculo ? vehiculo.id : null);
+            
+            contenidoHTML += `
+                    </div>
+            `;
+        });
+        
+        contenidoHTML += `
+                </div>
+        `;
+    }
+    
+    contenidoHTML += `
+            </div>
+        </div>
+    `;
+    
+    $('#vehiculosTabContent').append(contenidoHTML);
+
+    // Cargar respuestas banco por agente (después de insertar HTML)
+    if (usuariosBanco && usuariosBanco.length) {
+        usuariosBanco.forEach(function (usuario) {
+            const respBoxId = `resp_banco_${tabId}_${usuario.id}`;
+            const bancoLabel = [usuario.banco_nombre, ((usuario.usuario_nombre || '') + ' ' + (usuario.usuario_apellido || '')).trim()]
+                .filter(Boolean).join(' — ');
+            cargarRespuestasBancoEnMuro(solicitudId, usuario.id, '#' + respBoxId, bancoLabel);
+        });
+    }
+}
+
+// Función para cargar las notas del primer tab activo
+function cargarNotasPrimerTab() {
+    setTimeout(function() {
+        // Buscar el primer tab que esté visible (Bootstrap 5 usa .show para visible)
+        const primerContainer = $('.tab-pane.show .notas-container, .tab-pane.active .notas-container').first();
+        
+        if (primerContainer.length > 0) {
+            const containerId = primerContainer.attr('id');
+            const parts = containerId.split('_');
+            if (parts.length >= 3) {
+                const solicitudId = parts[1];
+                const vehiculoId = parts[2] !== 'general' ? parts[2] : null;
+                const usuarioBancoId = parts.length > 3 && parts[3] !== 'general' ? parts[3] : null;
+                cargarNotasMuro(solicitudId, vehiculoId, usuarioBancoId, containerId);
+            }
+        } else {
+            console.log('No se encontró contenedor de notas activo');
+        }
+    }, 300);
+}
+
+// Acordeón colapsado: Agregar Comentario (+ abre formulario + comentarios existentes)
+function generarSeccionNotasAcordeon(solicitudId, usuarioBancoId, vehiculoId) {
+    const uid = `notas_acc_${solicitudId}_${vehiculoId || 'general'}_${usuarioBancoId || 'general'}`;
+    const collapseId = `collapse_${uid}`;
+    return `
+        <div class="card mb-4 accordion-notas-muro">
+            <div class="card-header d-flex justify-content-between align-items-center py-2">
+                <h6 class="mb-0"><i class="fas fa-comment me-2"></i>Agregar Comentario</h6>
+                <button type="button"
+                    class="btn btn-sm btn-outline-primary btn-toggle-notas-muro"
+                    data-bs-toggle="collapse"
+                    data-bs-target="#${collapseId}"
+                    aria-expanded="false"
+                    aria-controls="${collapseId}"
+                    title="Abrir / cerrar">
+                    <i class="fas fa-plus icon-toggle-notas"></i>
+                </button>
+            </div>
+            <div id="${collapseId}" class="collapse">
+                <div class="card-body">
+                    ${generarFormularioNota(solicitudId, usuarioBancoId, vehiculoId)}
+                    <hr class="my-3">
+                    <h6 class="mb-3"><i class="fas fa-comments me-2"></i>Comentarios</h6>
+                    ${generarListaNotas(solicitudId, vehiculoId, usuarioBancoId)}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// Función para generar formulario de comentarios (contenido interno del acordeón)
+function generarFormularioNota(solicitudId, usuarioBancoId, vehiculoId) {
+    return `
+                <form class="formNotaMuro" data-solicitud="${solicitudId}" data-usuario-banco="${usuarioBancoId || ''}" data-vehiculo="${vehiculoId || ''}">
+                    <input type="hidden" name="tipo_nota" value="Comentario">
+                    <div class="mb-3">
+                        <label class="form-label">Comentario *</label>
+                        <textarea class="form-control" name="contenido" rows="3" required placeholder="Escriba su comentario aquí..."></textarea>
+                    </div>
+                    <div class="d-flex justify-content-end">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-paper-plane me-2"></i>Enviar Comentario
+                        </button>
+                    </div>
+                </form>
+    `;
+}
+
+// Función para generar lista de notas
+function generarListaNotas(solicitudId, vehiculoId, usuarioBancoId) {
+    const containerId = `notas_${solicitudId}_${vehiculoId || 'general'}_${usuarioBancoId || 'general'}`;
+    return `
+        <div id="${containerId}" class="notas-container">
+            <div class="text-center">
+                <i class="fas fa-spinner fa-spin me-2"></i>Cargando comentarios...
+            </div>
+        </div>
+    `;
+}
+
+// Alternar ícono + / − del acordeón de notas del muro
+$(document).on('show.bs.collapse', '.accordion-notas-muro .collapse', function () {
+    $(this).closest('.accordion-notas-muro').find('.icon-toggle-notas').removeClass('fa-plus').addClass('fa-minus');
+    $(this).closest('.accordion-notas-muro').find('.btn-toggle-notas-muro').attr('aria-expanded', 'true');
+});
+$(document).on('hide.bs.collapse', '.accordion-notas-muro .collapse', function () {
+    $(this).closest('.accordion-notas-muro').find('.icon-toggle-notas').removeClass('fa-minus').addClass('fa-plus');
+    $(this).closest('.accordion-notas-muro').find('.btn-toggle-notas-muro').attr('aria-expanded', 'false');
+});
+
+// Función para cargar información de la solicitud en el muro
+function cargarInfoSolicitud(id) {
+    $.ajax({
+        url: 'api/solicitudes.php',
+        type: 'GET',
+        data: { id: id },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                const solicitud = response.data;
+                const infoHtml = `
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header bg-primary text-white">
+                                <h6 class="mb-0"><i class="fas fa-user me-2"></i>Cliente</h6>
+                            </div>
+                            <div class="card-body">
+                                <p class="mb-1"><strong>Nombre:</strong> ${muroEsc(solicitud.nombre_cliente)}</p>
+                                <p class="mb-1"><strong>Cédula:</strong> ${muroEsc(solicitud.cedula)}</p>
+                                <p class="mb-1"><strong>Perfil financiero:</strong> ${muroEsc(solicitud.perfil_financiero || '—')}</p>
+                                <p class="mb-1"><strong>Teléfono:</strong> ${muroEsc(solicitud.telefono || '—')}</p>
+                                <p class="mb-0"><strong>Correo:</strong> ${muroEsc(solicitud.email || '—')}</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header bg-success text-white">
+                                <h6 class="mb-0"><i class="fas fa-car me-2"></i>Vehículo (apartado)</h6>
+                            </div>
+                            <div class="card-body" id="muroVehiculoApartadoBody">
+                                <p class="text-muted mb-0"><i class="fas fa-spinner fa-spin me-1"></i>Cargando...</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                $('#muroSolicitudInfo').html(infoHtml);
+
+                $.ajax({
+                    url: 'api/vehiculos_solicitud.php',
+                    type: 'GET',
+                    data: { solicitud_id: id },
+                    dataType: 'json'
+                }).done(function (rv) {
+                    var vehiculos = (rv && rv.success && Array.isArray(rv.data)) ? rv.data : [];
+                    $('#muroVehiculoApartadoBody').html(htmlTarjetaVehiculoApartado(vehiculos));
+                }).fail(function () {
+                    $('#muroVehiculoApartadoBody').html('<p class="text-danger mb-0">No se pudo cargar el vehículo apartado.</p>');
+                });
+            }
+        },
+        error: function() {
+            $('#muroSolicitudInfo').html('<div class="alert alert-danger">Error al cargar información de la solicitud</div>');
+        }
+    });
+}
+
+// Función para cargar notas del muro
+function cargarNotasMuro(solicitudId, vehiculoId, usuarioBancoId, containerId) {
+    const data = { solicitud_id: solicitudId };
+    
+    if (vehiculoId) {
+        data.vehiculo_id = vehiculoId;
+    }
+    if (usuarioBancoId) {
+        data.usuario_banco_id = usuarioBancoId;
+    }
+    
+    const container = containerId ? $('#' + containerId) : $('#muroNotasContainer');
+    
+    $.ajax({
+        url: 'api/notas.php',
+        type: 'GET',
+        data: data,
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarNotasMuro(response.data, container);
+            } else {
+                container.html('<div class="alert alert-danger">Error al cargar notas: ' + response.message + '</div>');
+            }
+        },
+        error: function() {
+            container.html('<div class="alert alert-danger">Error de conexión al cargar notas</div>');
+        }
+    });
+}
+
+// Función para mostrar comentarios en el muro
+function mostrarNotasMuro(notas, container) {
+    if (!container) {
+        container = $('#muroNotasContainer');
+    }
+    
+    if (notas.length === 0) {
+        container.html('<div class="alert alert-info text-center">No hay comentarios para esta sección</div>');
+        return;
+    }
+    
+    let html = '';
+    notas.forEach(function(nota) {
+        const fecha = new Date(nota.fecha_creacion).toLocaleString('es-PA');
+        const contenidoHtml = muroEsc(nota.contenido || '').replace(/\n/g, '<br>');
+        
+        html += `
+            <div class="card mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <div>
+                        <strong>${muroEsc(nota.nombre || '')} ${muroEsc(nota.apellido || '')}</strong>
+                        <span class="badge bg-primary ms-2">Comentario</span>
+                    </div>
+                    <small class="text-muted">${muroEsc(fecha)}</small>
+                </div>
+                <div class="card-body">
+                    <p class="card-text mb-0">${contenidoHtml}</p>
+                </div>
+            </div>
+        `;
+    });
+    
+    container.html(html);
+}
+
+// Función para enviar nota desde formulario dinámico del muro
+function enviarNotaMuro($form) {
+    const formData = new FormData($form[0]);
+    
+    // Agregar datos adicionales del formulario
+    const solicitudId = $form.data('solicitud');
+    const usuarioBancoId = $form.data('usuario-banco');
+    const vehiculoId = $form.data('vehiculo');
+    
+    formData.append('solicitud_id', solicitudId);
+    
+    if (usuarioBancoId) {
+        formData.append('usuario_banco_id', usuarioBancoId);
+    }
+    if (vehiculoId) {
+        formData.append('vehiculo_id', vehiculoId);
+    }
+    
+    $.ajax({
+        url: 'api/notas.php',
+        type: 'POST',
+        data: formData,
+        processData: false,
+        contentType: false,
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarAlerta('Comentario enviado correctamente', 'success');
+                $form[0].reset();
+                
+                // Recargar notas del contenedor correspondiente
+                const containerId = $form.closest('.tab-pane').find('.notas-container:first').attr('id');
+                const parts = containerId.split('_');
+                if (parts.length >= 3) {
+                    const solId = parts[1];
+                    const vehId = parts[2] !== 'general' ? parts[2] : null;
+                    const usrBancoId = parts.length > 3 && parts[3] !== 'general' ? parts[3] : null;
+                    cargarNotasMuro(solId, vehId, usrBancoId, containerId);
+                }
+            } else {
+                mostrarAlerta('Error al enviar comentario: ' + response.message, 'danger');
+            }
+        },
+        error: function() {
+            mostrarAlerta('Error de conexión al enviar comentario', 'danger');
+        }
+    });
+}
+
+// Función para enviar nota (compatibilidad con formulario antiguo)
+function enviarNota() {
+    const formData = new FormData($('#notaForm')[0]);
+    
+    $.ajax({
+        url: 'api/notas.php',
+        type: 'POST',
+        data: formData,
+        processData: false,
+        contentType: false,
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarAlerta('Nota enviada correctamente', 'success');
+                $('#notaForm')[0].reset();
+                $('#nota_solicitud_id').val($('#nota_solicitud_id').val()); // Mantener el ID
+                
+                // Recargar notas
+                const solicitudId = $('#nota_solicitud_id').val();
+                cargarNotasMuro(solicitudId);
+            } else {
+                mostrarAlerta('Error al enviar nota: ' + response.message, 'danger');
+            }
+        },
+        error: function() {
+            mostrarAlerta('Error de conexión al enviar nota', 'danger');
+        }
+    });
+}
+
+// Función para eliminar solicitud
+function eliminarSolicitud(solicitudId) {
+    // Mostrar confirmación
+    if (!confirm('¿Estás seguro de que deseas eliminar esta solicitud?\n\nEsta acción eliminará:\n- La solicitud\n- Todas las notas del muro\n- Todos los archivos adjuntos\n\nEsta acción NO se puede deshacer.')) {
+        return;
+    }
+    
+    // Mostrar confirmación adicional para mayor seguridad
+    if (!confirm('CONFIRMACIÓN FINAL:\n\n¿Realmente deseas eliminar esta solicitud?\n\nEsta acción es IRREVERSIBLE.')) {
+        return;
+    }
+    
+    console.log('=== ELIMINANDO SOLICITUD ===');
+    console.log('ID de solicitud:', solicitudId);
+    
+    $.ajax({
+        url: 'api/solicitudes.php',
+        type: 'DELETE',
+        data: { id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            console.log('Respuesta de eliminación:', response);
+            if (response.success) {
+                mostrarAlerta('Solicitud eliminada correctamente junto con sus notas y adjuntos', 'success');
+                
+                // Recargar la tabla de solicitudes
+                cargarSolicitudes();
+                
+                // Cerrar cualquier modal abierto
+                $('.modal').modal('hide');
+            } else {
+                mostrarAlerta('Error al eliminar solicitud: ' + response.message, 'danger');
+            }
+        },
+        error: function(xhr, status, error) {
+            console.error('Error AJAX:', error);
+            console.error('Status:', status);
+            console.error('Response:', xhr.responseText);
+            
+            let mensaje = 'Error de conexión al eliminar solicitud';
+            if (xhr.responseJSON && xhr.responseJSON.message) {
+                mensaje = xhr.responseJSON.message;
+            }
+            mostrarAlerta(mensaje, 'danger');
+        }
+    });
+}
+
+// Función para mostrar alertas
+function mostrarAlerta(mensaje, tipo) {
+    const alerta = `
+        <div class="alert alert-${tipo} alert-dismissible fade show" role="alert">
+            <i class="fas fa-${tipo === 'success' ? 'check-circle' : 'exclamation-triangle'} me-2"></i>
+            ${mensaje}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+    `;
+    
+    // Insertar alerta al inicio del contenido principal
+    $('.main-content .container-fluid').prepend(alerta);
+    
+    // Auto-ocultar después de 5 segundos
+    setTimeout(function() {
+        $('.alert').fadeOut();
+    }, 5000);
+}
+
+// ===== FUNCIONES DE USUARIOS BANCO =====
+
+let solicitudActualId = null;
+let usuarioSeleccionado = null;
+
+/**
+ * Configurar funcionalidad de usuarios banco
+ */
+function configurarUsuariosBanco() {
+    // Autocompletado de usuarios banco
+    $('#buscar_usuario_banco').on('input', function() {
+        const termino = $(this).val();
+        if (termino.length >= 2) {
+            buscarUsuariosBanco(termino);
+        } else {
+            $('#sugerencias_usuarios').hide();
+        }
+    });
+    
+    // Ocultar sugerencias al hacer clic fuera
+    $(document).on('click', function(e) {
+        if (!$(e.target).closest('#buscar_usuario_banco, #sugerencias_usuarios').length) {
+            $('#sugerencias_usuarios').hide();
+        }
+    });
+    
+    // Manejar clic en sugerencias usando delegación de eventos
+    $(document).on('click', '.sugerencia-usuario', function() {
+        console.log('Clic en sugerencia detectado');
+        
+        // Obtener datos de los atributos individuales
+        const $element = $(this);
+        usuarioSeleccionado = {
+            id: $element.data('usuario-id'),
+            nombre: $element.data('usuario-nombre'),
+            apellido: $element.data('usuario-apellido'),
+            email: $element.data('usuario-email'),
+            banco_nombre: $element.data('usuario-banco')
+        };
+        
+        console.log('Usuario seleccionado:', usuarioSeleccionado);
+        
+        // Validar que tenemos los datos necesarios
+        if (!usuarioSeleccionado.id || !usuarioSeleccionado.nombre) {
+            console.error('Datos de usuario incompletos:', usuarioSeleccionado);
+            mostrarAlerta('Error al seleccionar usuario', 'danger');
+            return;
+        }
+        
+        $('#buscar_usuario_banco').val(`${usuarioSeleccionado.nombre} ${usuarioSeleccionado.apellido} - ${usuarioSeleccionado.banco_nombre || 'Sin banco'}`);
+        $('#agregar_usuario_banco').prop('disabled', false);
+        $('#sugerencias_usuarios').hide();
+        
+        console.log('Usuario seleccionado correctamente');
+    });
+    
+    // Agregar usuario banco
+    $('#agregar_usuario_banco').on('click', function() {
+        console.log('Botón agregar usuario clickeado');
+        console.log('Usuario seleccionado:', usuarioSeleccionado);
+        console.log('Solicitud actual ID:', solicitudActualId);
+        if (usuarioSeleccionado && solicitudActualId) {
+            asignarUsuarioBanco(solicitudActualId, usuarioSeleccionado.id);
+        } else {
+            console.error('No se puede asignar: usuario o solicitud faltante');
+            mostrarAlerta('Por favor seleccione un usuario y asegúrese de estar editando una solicitud', 'warning');
+        }
+    });
+    
+    // Enviar mensaje
+    $('#enviar_mensaje').on('click', function() {
+        const mensaje = $('#mensaje_muro').val().trim();
+        if (mensaje && solicitudActualId) {
+            enviarMensaje(solicitudActualId, mensaje);
+        }
+    });
+}
+
+/**
+ * Buscar usuarios banco para autocompletado
+ */
+function buscarUsuariosBanco(termino) {
+    console.log('Buscando usuarios banco con término:', termino);
+    $.ajax({
+        url: 'api/usuarios_banco_solicitudes.php',
+        type: 'GET',
+        data: { q: termino },
+        dataType: 'json',
+        success: function(response) {
+            console.log('Respuesta de búsqueda:', response);
+            if (response.success) {
+                console.log('Usuarios encontrados:', response.data.length);
+                mostrarSugerencias(response.data);
+            } else {
+                console.error('Error en respuesta:', response.message);
+            }
+        },
+        error: function(xhr, status, error) {
+            console.error('Error al buscar usuarios banco:', error);
+            console.error('Status:', status);
+            console.error('Response:', xhr.responseText);
+        }
+    });
+}
+
+/**
+ * Mostrar sugerencias de usuarios
+ */
+function mostrarSugerencias(usuarios) {
+    console.log('Mostrando sugerencias para usuarios:', usuarios);
+    const container = $('#sugerencias_usuarios');
+    container.empty();
+    
+    if (usuarios.length === 0) {
+        container.html('<div class="list-group-item text-muted">No se encontraron usuarios</div>');
+    } else {
+        usuarios.forEach(usuario => {
+            console.log('Agregando sugerencia para usuario:', usuario);
+            const item = $(`
+                <div class="list-group-item list-group-item-action sugerencia-usuario" 
+                     data-usuario-id="${usuario.id}"
+                     data-usuario-nombre="${usuario.nombre}"
+                     data-usuario-apellido="${usuario.apellido}"
+                     data-usuario-email="${usuario.email}"
+                     data-usuario-banco="${usuario.banco_nombre || ''}">
+                    <div class="d-flex w-100 justify-content-between">
+                        <h6 class="mb-1">${usuario.nombre} ${usuario.apellido}</h6>
+                        <small>${usuario.banco_nombre || 'Sin banco'}</small>
+                    </div>
+                    <p class="mb-1 text-muted">${usuario.email}</p>
+                </div>
+            `);
+            container.append(item);
+        });
+    }
+    
+    console.log('Sugerencias agregadas, mostrando container');
+    container.show();
+}
+
+/**
+ * Asignar usuario banco a solicitud
+ */
+function asignarUsuarioBanco(solicitudId, usuarioId) {
+    console.log('Asignando usuario banco:', { solicitudId, usuarioId });
+    $.ajax({
+        url: 'api/usuarios_banco_solicitudes.php',
+        type: 'POST',
+        data: {
+            solicitud_id: solicitudId,
+            usuario_banco_id: usuarioId
+        },
+        dataType: 'json',
+        success: function(response) {
+            console.log('Respuesta de asignación:', response);
+            if (response.success) {
+                mostrarAlerta('Usuario asignado correctamente', 'success');
+                cargarUsuariosAsignados(solicitudId);
+                limpiarFormularioUsuario();
+            } else {
+                mostrarAlerta(response.message, 'danger');
+            }
+        },
+        error: function(xhr, status, error) {
+            // Si el servidor devolvió JSON con success: true (p. ej. tras error en envío de correo), tratar como éxito
+            try {
+                const data = JSON.parse(xhr.responseText || '{}');
+                if (data.success) {
+                    mostrarAlerta(data.message || 'Usuario asignado correctamente', 'success');
+                    cargarUsuariosAsignados(solicitudId);
+                    limpiarFormularioUsuario();
+                    return;
+                }
+            } catch (e) { /* no es JSON válido */ }
+            console.error('Error al asignar usuario:', error);
+            console.error('Status:', status);
+            console.error('Response:', xhr.responseText);
+            mostrarAlerta('Error al asignar usuario', 'danger');
+        }
+    });
+}
+
+/**
+ * Cargar usuarios asignados a una solicitud
+ */
+function cargarUsuariosAsignados(solicitudId) {
+    $.ajax({
+        url: 'api/usuarios_banco_solicitudes.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarUsuariosAsignados(response.data);
+            }
+        },
+        error: function() {
+            console.error('Error al cargar usuarios asignados');
+        }
+    });
+}
+
+/**
+ * Mostrar usuarios asignados en la tabla
+ */
+function mostrarUsuariosAsignados(usuarios) {
+    const tbody = $('#usuariosAsignadosBody');
+    tbody.empty();
+    
+    if (usuarios.length === 0) {
+        tbody.html('<tr><td colspan="7" class="text-center text-muted">No hay usuarios asignados</td></tr>');
+        window._listaUsuariosBancoTab = [];
+        $('#btnEnviarResumenTodos').prop('disabled', true);
+        return;
+    }
+
+    window._listaUsuariosBancoTab = usuarios;
+    $('#btnEnviarResumenTodos').prop('disabled', false);
+
+    usuarios.forEach(usuario => {
+        const estadoClass = usuario.estado === 'activo' ? 'success' : 'secondary';
+        const estadoText = usuario.estado === 'activo' ? 'Activo' : 'Inactivo';
+        const numCorreos = usuario.correos_enviados != null ? parseInt(usuario.correos_enviados, 10) : 0;
+        const correosMostrar = Number.isFinite(numCorreos) ? numCorreos : 0;
+        
+        const emailEsc = (usuario.usuario_email || '').replace(/"/g, '&quot;');
+        const nombreEsc = ((usuario.usuario_nombre || '') + ' ' + (usuario.usuario_apellido || '')).trim().replace(/"/g, '&quot;');
+        const row = $(`
+            <tr>
+                <td>
+                    <div>
+                        <strong>${usuario.usuario_nombre || ''} ${usuario.usuario_apellido || ''}</strong><br>
+                        <small class="text-muted">${usuario.usuario_email || ''}</small>
+                    </div>
+                </td>
+                <td>${usuario.banco_nombre || 'Sin banco'}</td>
+                <td><span class="badge bg-${estadoClass}">${estadoText}</span></td>
+                <td>${formatearFecha(usuario.fecha_asignacion)}</td>
+                <td><span class="badge bg-info text-dark" title="Correos enviados a este usuario banco para esta solicitud">${correosMostrar}</span></td>
+                <td>-</td>
+                <td>
+                    <div class="btn-group btn-group-sm">
+                        <button type="button" class="btn btn-outline-primary btn-enviar-resumen-banco" title="Enviar resumen por correo"
+                                data-usuario-banco-id="${usuario.usuario_banco_id}"
+                                data-usuario-email="${emailEsc}"
+                                data-usuario-nombre="${nombreEsc}">
+                            <i class="fas fa-envelope"></i>
+                        </button>
+                        <button class="btn btn-outline-${usuario.estado === 'activo' ? 'warning' : 'success'}" 
+                                onclick="cambiarEstadoUsuario(${usuario.id}, '${usuario.estado === 'activo' ? 'inactivo' : 'activo'}')">
+                            <i class="fas fa-${usuario.estado === 'activo' ? 'pause' : 'play'}"></i>
+                        </button>
+                        <button class="btn btn-outline-danger" onclick="desasignarUsuario(${usuario.id})">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `);
+        tbody.append(row);
+    });
+}
+
+/**
+ * Cambiar estado de usuario (activar/desactivar)
+ */
+function cambiarEstadoUsuario(id, nuevoEstado) {
+    console.log('Cambiando estado de usuario:', { id, nuevoEstado });
+    $.ajax({
+        url: 'api/usuarios_banco_solicitudes.php',
+        type: 'PUT',
+        data: {
+            id: id,
+            estado: nuevoEstado
+        },
+        dataType: 'json',
+        success: function(response) {
+            console.log('Respuesta de cambio de estado:', response);
+            if (response.success) {
+                mostrarAlerta('Estado actualizado correctamente', 'success');
+                cargarUsuariosAsignados(solicitudActualId);
+            } else {
+                mostrarAlerta(response.message, 'danger');
+            }
+        },
+        error: function(xhr, status, error) {
+            console.error('Error al actualizar estado:', error);
+            console.error('Status:', status);
+            console.error('Response:', xhr.responseText);
+            mostrarAlerta('Error al actualizar estado', 'danger');
+        }
+    });
+}
+
+/**
+ * Delegación: botón enviar resumen por correo a usuario banco
+ */
+$(document).on('click', '.btn-enviar-resumen-banco', function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var btn = $(this);
+    var usuarioBancoId = btn.data('usuario-banco-id');
+    var email = btn.data('usuario-email') || '';
+    var nombre = btn.data('usuario-nombre') || 'Usuario banco';
+    if (!solicitudActualId || !usuarioBancoId) return;
+    $('#modalEnviarResumenBanco .resumen-destino').text(email || nombre);
+    $('#modalEnviarResumenBanco').data('solicitud-id', solicitudActualId).data('usuario-banco-id', usuarioBancoId).modal('show');
+});
+
+/**
+ * Abrir modal enviar resumen a todos los usuarios banco asignados
+ */
+$(document).on('click', '#btnEnviarResumenTodos', function(e) {
+    e.preventDefault();
+    if (!solicitudActualId) return;
+    var lista = window._listaUsuariosBancoTab || [];
+    if (!lista.length) return;
+    $('#modalEnviarResumenBancoTodos .resumen-todos-cantidad').text(String(lista.length));
+    $('#modalEnviarResumenBancoTodos').data('solicitud-id', solicitudActualId).modal('show');
+});
+
+/**
+ * Confirmar envío de resumen por correo
+ */
+function confirmarEnviarResumenBanco() {
+    var modal = $('#modalEnviarResumenBanco');
+    var solicitudId = modal.data('solicitud-id');
+    var usuarioBancoId = modal.data('usuario-banco-id');
+    if (!solicitudId || !usuarioBancoId) return;
+    modal.modal('hide');
+    $.ajax({
+        url: 'api/enviar_resumen_banco.php',
+        type: 'POST',
+        data: { solicitud_id: solicitudId, usuario_banco_id: usuarioBancoId },
+        dataType: 'json',
+        success: function(res) {
+            if (res.success) {
+                var okMsg = res.message || 'Resumen enviado por correo correctamente';
+                mostrarAlerta(okMsg, 'success');
+                alert('Confirmacion: ' + okMsg);
+                if (typeof solicitudActualId !== 'undefined' && solicitudActualId) {
+                    cargarUsuariosAsignados(solicitudActualId);
+                }
+            } else {
+                var failMsg = res.message || 'Error al enviar';
+                mostrarAlerta(failMsg, 'danger');
+                alert('No se pudo enviar el resumen: ' + failMsg);
+            }
+        },
+        error: function(xhr) {
+            var msg = 'Error al enviar el resumen';
+            try {
+                var d = JSON.parse(xhr.responseText || '{}');
+                if (d.message) msg = d.message;
+            } catch (e) {}
+            mostrarAlerta(msg, 'danger');
+            alert('No se pudo enviar el resumen: ' + msg);
+        }
+    });
+}
+
+/**
+ * Confirmar envío de resumen a todos los usuarios banco asignados
+ */
+function confirmarEnviarResumenBancoTodos() {
+    var modal = $('#modalEnviarResumenBancoTodos');
+    var solicitudId = modal.data('solicitud-id');
+    if (!solicitudId) return;
+    modal.modal('hide');
+    $.ajax({
+        url: 'api/enviar_resumen_banco_todos.php',
+        type: 'POST',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(res) {
+            if (res.success) {
+                var okMsg = res.message || 'Resúmenes enviados correctamente';
+                if (res.partial) {
+                    mostrarAlerta(okMsg, 'warning');
+                } else {
+                    mostrarAlerta(okMsg, 'success');
+                }
+                alert('Confirmación: ' + okMsg);
+                if (typeof solicitudActualId !== 'undefined' && solicitudActualId) {
+                    cargarUsuariosAsignados(solicitudActualId);
+                }
+            } else {
+                var failMsg = res.message || 'Error al enviar';
+                mostrarAlerta(failMsg, 'danger');
+                alert('No se pudo completar el envío: ' + failMsg);
+            }
+        },
+        error: function(xhr) {
+            var msg = 'Error al enviar los resúmenes';
+            try {
+                var d = JSON.parse(xhr.responseText || '{}');
+                if (d.message) msg = d.message;
+            } catch (e) {}
+            mostrarAlerta(msg, 'danger');
+            alert('No se pudo completar el envío: ' + msg);
+        }
+    });
+}
+
+/**
+ * Desasignar usuario
+ */
+function desasignarUsuario(id) {
+    console.log('Desasignando usuario con ID:', id);
+    if (confirm('¿Está seguro de que desea desasignar este usuario?')) {
+        $.ajax({
+            url: 'api/usuarios_banco_solicitudes.php?id=' + id,
+            type: 'DELETE',
+            dataType: 'json',
+            success: function(response) {
+                console.log('Respuesta de desasignación:', response);
+                if (response.success) {
+                    mostrarAlerta('Usuario desasignado correctamente', 'success');
+                    cargarUsuariosAsignados(solicitudActualId);
+                } else {
+                    mostrarAlerta(response.message, 'danger');
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('Error al desasignar usuario:', error);
+                console.error('Status:', status);
+                console.error('Response:', xhr.responseText);
+                mostrarAlerta('Error al desasignar usuario', 'danger');
+            }
+        });
+    }
+}
+
+/**
+ * Enviar mensaje al muro
+ */
+function enviarMensaje(solicitudId, mensaje) {
+    $.ajax({
+        url: 'api/mensajes_solicitud.php',
+        type: 'POST',
+        data: {
+            solicitud_id: solicitudId,
+            mensaje: mensaje
+        },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarAlerta('Mensaje enviado correctamente', 'success');
+                $('#mensaje_muro').val('');
+                cargarMensajes(solicitudId);
+            } else {
+                mostrarAlerta(response.message, 'danger');
+            }
+        },
+        error: function() {
+            mostrarAlerta('Error al enviar mensaje', 'danger');
+        }
+    });
+}
+
+/**
+ * Cargar mensajes del muro
+ */
+function cargarMensajes(solicitudId) {
+    $.ajax({
+        url: 'api/mensajes_solicitud.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarMensajes(response.data);
+            }
+        },
+        error: function() {
+            console.error('Error al cargar mensajes');
+        }
+    });
+}
+
+/**
+ * Mostrar mensajes en el historial
+ */
+function mostrarMensajes(mensajes) {
+    const container = $('#historialMensajes');
+    container.empty();
+    
+    if (mensajes.length === 0) {
+        container.html('<div class="text-center text-muted">No hay mensajes</div>');
+        return;
+    }
+    
+    mensajes.forEach(mensaje => {
+        const tipoClass = {
+            'banco': 'info',
+            'gestor': 'primary',
+            'general': 'secondary'
+        }[mensaje.tipo] || 'secondary';
+        
+        const item = $(`
+            <div class="card mb-2">
+                <div class="card-body p-2">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <div>
+                            <strong>${mensaje.nombre} ${mensaje.apellido}</strong>
+                            <span class="badge bg-${tipoClass} ms-2">${mensaje.rol_nombre || 'Usuario'}</span>
+                        </div>
+                        <small class="text-muted">${formatearFecha(mensaje.fecha_creacion)}</small>
+                    </div>
+                    <p class="mb-0 mt-1">${mensaje.mensaje}</p>
+                </div>
+            </div>
+        `);
+        container.append(item);
+    });
+    
+    // Scroll al final
+    container.scrollTop(container[0].scrollHeight);
+}
+
+/**
+ * Limpiar formulario de usuario
+ */
+function limpiarFormularioUsuario() {
+    $('#buscar_usuario_banco').val('');
+    $('#agregar_usuario_banco').prop('disabled', true);
+    usuarioSeleccionado = null;
+    $('#sugerencias_usuarios').hide();
+}
+
+/**
+ * Inicializar pestaña de usuarios banco cuando se abre el modal
+ */
+function inicializarUsuariosBanco(solicitudId) {
+    solicitudActualId = solicitudId;
+    if (solicitudId) {
+        cargarUsuariosAsignados(solicitudId);
+        cargarMensajes(solicitudId);
+    }
+}
+
+/**
+ * Deshabilitar todos los campos de edición para usuarios banco
+ */
+function deshabilitarCamposParaBanco() {
+    console.log('=== DESHABILITANDO CAMPOS PARA USUARIO BANCO ===');
+    
+    // Deshabilitar todos los inputs, selects y textareas en el modal
+    $('#solicitudModal input, #solicitudModal select, #solicitudModal textarea').each(function() {
+        $(this).prop('disabled', true);
+        $(this).addClass('form-control-disabled');
+    });
+    
+    // Deshabilitar botones de acción
+    $('#solicitudModal button[type="submit"]').prop('disabled', true);
+    $('#solicitudModal button[id*="btn"]').prop('disabled', true);
+    
+    // Agregar estilo visual para indicar que está deshabilitado
+    $('<style>')
+        .prop('type', 'text/css')
+        .html(`
+            .form-control-disabled {
+                background-color: #f8f9fa !important;
+                opacity: 0.7 !important;
+                cursor: not-allowed !important;
+            }
+            .form-control-disabled:focus {
+                box-shadow: none !important;
+                border-color: #ced4da !important;
+            }
+        `)
+        .appendTo('head');
+}
+
+// ==================== GESTIÓN DE VEHÍCULOS ====================
+let vehiculosList = [];
+
+/**
+ * Agregar un nuevo vehículo al formulario
+ */
+function agregarVehiculo() {
+    const index = vehiculosList.length;
+    vehiculosList.push({
+        id: null,
+        marca: '',
+        modelo: '',
+        anio: '',
+        kilometraje: '',
+        precio: '',
+        abono_porcentaje: '',
+        abono_monto: '',
+        unidad: ''
+    });
+    renderizarVehiculos();
+}
+
+  /**
+   * Eliminar un vehículo de la lista
+   */
+  function eliminarVehiculo(index) {
+      vehiculosList.splice(index, 1);
+      renderizarVehiculos();
+  }
+  
+  /**
+   * Abrir modal para confirmar apartar vehículo
+   */
+  function abrirModalApartarVehiculo(index) {
+      if (!vehiculosList[index]) {
+          mostrarAlerta('Vehículo no encontrado', 'danger');
+          return;
+      }
+      
+      const vehiculo = vehiculosList[index];
+      const marcaModelo = vehiculo.marca && vehiculo.modelo 
+          ? `${vehiculo.marca} ${vehiculo.modelo}` 
+          : `Vehículo ${index + 1}`;
+      
+      // Guardar el index del vehículo en un campo oculto
+      $('#vehiculo_index_apartar').val(index);
+      
+      // Mostrar información del vehículo en la modal
+      $('#vehiculo_info_apartar').text(marcaModelo);
+      
+      // Mostrar la modal
+      $('#modalApartarVehiculo').modal('show');
+  }
+
+function parseNumeroVehiculo(val) {
+    if (val === null || val === undefined || val === '') {
+        return null;
+    }
+    var n = parseFloat(String(val).replace(/,/g, ''));
+    return isNaN(n) ? null : n;
+}
+
+/**
+ * Monto abono = precio × (abono % / 100). Vacío si falta precio o porcentaje.
+ */
+function calcularAbonoMontoVehiculo(precio, abonoPorcentaje) {
+    var p = parseNumeroVehiculo(precio);
+    var pct = parseNumeroVehiculo(abonoPorcentaje);
+    if (p === null || pct === null) {
+        return null;
+    }
+    return (Math.round(p * (pct / 100) * 100) / 100).toFixed(2);
+}
+
+/**
+ * Abono % = (monto / precio) × 100. Vacío si falta precio o monto.
+ */
+function calcularAbonoPorcentajeVehiculo(precio, abonoMonto) {
+    var p = parseNumeroVehiculo(precio);
+    var m = parseNumeroVehiculo(abonoMonto);
+    if (p === null || m === null || p <= 0) {
+        return null;
+    }
+    return (Math.round((m / p) * 10000) / 100).toFixed(2);
+}
+
+function recalcularAbonoMontoVehiculo(index) {
+    if (!vehiculosList[index]) {
+        return;
+    }
+    var v = vehiculosList[index];
+    var calculado = calcularAbonoMontoVehiculo(v.precio, v.abono_porcentaje);
+    if (calculado !== null) {
+        v.abono_monto = calculado;
+    } else if (
+        v.precio === '' || v.precio === null || v.precio === undefined ||
+        v.abono_porcentaje === '' || v.abono_porcentaje === null || v.abono_porcentaje === undefined
+    ) {
+        v.abono_monto = '';
+    }
+    var $inp = $('#veh-abono-monto-' + index);
+    if ($inp.length) {
+        $inp.val(v.abono_monto || '');
+    }
+}
+
+function recalcularAbonoPorcentajeVehiculo(index) {
+    if (!vehiculosList[index]) {
+        return;
+    }
+    var v = vehiculosList[index];
+    var calculado = calcularAbonoPorcentajeVehiculo(v.precio, v.abono_monto);
+    if (calculado !== null) {
+        v.abono_porcentaje = calculado;
+    } else if (
+        v.precio === '' || v.precio === null || v.precio === undefined ||
+        v.abono_monto === '' || v.abono_monto === null || v.abono_monto === undefined
+    ) {
+        v.abono_porcentaje = '';
+    }
+    var $inp = $('#veh-abono-pct-' + index);
+    if ($inp.length) {
+        $inp.val(v.abono_porcentaje || '');
+    }
+}
+
+function recalcularAbonosVehiculoPorPrecio(index) {
+    if (!vehiculosList[index]) {
+        return;
+    }
+    var v = vehiculosList[index];
+    var tienePct = v.abono_porcentaje !== '' && v.abono_porcentaje !== null && v.abono_porcentaje !== undefined;
+    var tieneMonto = v.abono_monto !== '' && v.abono_monto !== null && v.abono_monto !== undefined;
+    if (tienePct) {
+        recalcularAbonoMontoVehiculo(index);
+    } else if (tieneMonto) {
+        recalcularAbonoPorcentajeVehiculo(index);
+    }
+}
+
+function sincronizarAbonosVehiculosLista() {
+    vehiculosList.forEach(function (_, i) {
+        recalcularAbonosVehiculoPorPrecio(i);
+    });
+}
+
+/**
+ * Actualizar un campo de vehículo
+ */
+function actualizarVehiculo(index, campo, valor) {
+    if (vehiculosList[index]) {
+        vehiculosList[index][campo] = valor;
+        if (campo === 'precio') {
+            recalcularAbonosVehiculoPorPrecio(index);
+        } else if (campo === 'abono_porcentaje') {
+            recalcularAbonoMontoVehiculo(index);
+        } else if (campo === 'abono_monto') {
+            recalcularAbonoPorcentajeVehiculo(index);
+        }
+    }
+}
+
+/**
+ * Renderizar la lista de vehículos
+ */
+function renderizarVehiculos() {
+    const container = $('#listaVehiculos');
+    container.empty();
+    
+    if (vehiculosList.length === 0) {
+        container.html('<div class="alert alert-info">No hay vehículos agregados</div>');
+        return;
+    }
+    
+    vehiculosList.forEach((vehiculo, index) => {
+        // Verificar si el usuario puede ver los botones (solo admin y gestor)
+        const puedeEditar = window.userRoles && (window.userRoles.isAdmin || window.userRoles.isGestor);
+        const botonesHTML = puedeEditar ? `
+                      <div class="btn-group btn-group-sm">
+                          <button type="button" class="btn btn-warning" onclick="abrirModalApartarVehiculo(${index})" title="Apartar Vehículo">
+                              <i class="fas fa-bookmark"></i> Apartar
+                          </button>
+                          <button type="button" class="btn btn-danger" onclick="eliminarVehiculo(${index})" title="Eliminar Vehículo">
+                              <i class="fas fa-trash"></i>
+                          </button>
+                      </div>` : '';
+        
+        const card = $(`
+                          <div class="card mb-3" data-index="${index}">
+                  <div class="card-header d-flex justify-content-between align-items-center">
+                      <strong>Vehículo ${index + 1}</strong>
+                      ${botonesHTML}
+                  </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Unidad</label>
+                                <input type="text" class="form-control bg-light" readonly
+                                       value="${vehiculo.unidad || ''}"
+                                       placeholder="Se asigna al coincidir con una reserva">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Marca</label>
+                                <input type="text" class="form-control" 
+                                       value="${vehiculo.marca || ''}" 
+                                       onchange="actualizarVehiculo(${index}, 'marca', this.value)">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Modelo</label>
+                                <input type="text" class="form-control" 
+                                       value="${vehiculo.modelo || ''}" 
+                                       onchange="actualizarVehiculo(${index}, 'modelo', this.value)">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Año</label>
+                                <input type="number" class="form-control" 
+                                       value="${vehiculo.anio || ''}" 
+                                       onchange="actualizarVehiculo(${index}, 'anio', this.value)">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Kilometraje</label>
+                                <input type="number" class="form-control" 
+                                       value="${vehiculo.kilometraje || ''}" 
+                                       onchange="actualizarVehiculo(${index}, 'kilometraje', this.value)">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Precio</label>
+                                <input type="number" class="form-control" step="0.01"
+                                       value="${vehiculo.precio || ''}" 
+                                       oninput="actualizarVehiculo(${index}, 'precio', this.value)"
+                                       onchange="actualizarVehiculo(${index}, 'precio', this.value)">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Abono (%)</label>
+                                <input type="number" class="form-control" step="0.01" min="0" max="100"
+                                       id="veh-abono-pct-${index}"
+                                       value="${vehiculo.abono_porcentaje || ''}" 
+                                       oninput="actualizarVehiculo(${index}, 'abono_porcentaje', this.value)"
+                                       onchange="actualizarVehiculo(${index}, 'abono_porcentaje', this.value)">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">Monto abono</label>
+                                <input type="number" class="form-control" step="0.01" min="0"
+                                       id="veh-abono-monto-${index}"
+                                       value="${vehiculo.abono_monto || ''}"
+                                       oninput="actualizarVehiculo(${index}, 'abono_monto', this.value)"
+                                       onchange="actualizarVehiculo(${index}, 'abono_monto', this.value)"
+                                       placeholder="0.00">
+                                <small class="text-muted">Ingrese % o monto; el otro se calcula con el precio</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `);
+        container.append(card);
+    });
+}
+
+/**
+ * Limpiar lista de vehículos
+ */
+function limpiarVehiculos() {
+    vehiculosList = [];
+    renderizarVehiculos();
+}
+
+/**
+ * Cargar vehículos existentes para una solicitud
+ */
+function cargarVehiculos(solicitudId) {
+    $.ajax({
+        url: 'api/vehiculos_solicitud.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                vehiculosList = response.data || [];
+                sincronizarAbonosVehiculosLista();
+                renderizarVehiculos();
+            }
+        },
+        error: function() {
+            console.error('Error al cargar vehículos');
+        }
+    });
+}
+
+/**
+ * Guardar vehículos de la solicitud
+ */
+function guardarVehiculos(solicitudId) {
+    sincronizarAbonosVehiculosLista();
+    $.ajax({
+        url: 'api/vehiculos_solicitud.php',
+        type: 'POST',
+        data: {
+            solicitud_id: solicitudId,
+            vehiculos: JSON.stringify(vehiculosList)
+        },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                const solicitudIdAnterior = $('#solicitud_id').val();
+                mostrarAlertaFinGuardado(solicitudIdAnterior, solicitudId);
+            } else {
+                mostrarAlerta('Error al guardar vehículos: ' + response.message, 'danger');
+            }
+        },
+        error: function(xhr) {
+            let msg = 'Error de conexión al guardar vehículos';
+            if (xhr.responseText) {
+                try {
+                    const data = JSON.parse(xhr.responseText);
+                    if (data.message) msg = 'Error al guardar vehículos: ' + data.message;
+                } catch (e) { /* mantener msg por defecto */ }
+            }
+            mostrarAlerta(msg, 'danger');
+        }
+    });
+}
+
+/**
+ * Mostrar alerta final después de guardar
+ */
+function mostrarAlertaFinGuardado(solicitudIdAnterior, nuevaSolicitudId) {
+    const mensaje = solicitudIdAnterior ? 'Solicitud actualizada correctamente' : 'Solicitud creada correctamente';
+    mostrarAlerta(mensaje, 'success');
+    
+    // Si es una nueva solicitud, mostrar mensaje
+    if (!solicitudIdAnterior) {
+        mostrarAlerta('Solicitud creada correctamente. Puedes gestionar adjuntos desde la tabla de solicitudes.', 'success');
+    }
+    
+    $('#solicitudModal').modal('hide');
+    limpiarVehiculos();
+    // El sistema no es reactivo: forzamos recarga para reflejar cambios.
+    setTimeout(function() {
+        window.location.reload();
+    }, 400);
+}
+
+// ========== EVENTOS CITA Y FIRMA (reactivo, sin recargar página) ==========
+
+function verificarEvaluacionSeleccionada(solicitudId) {
+    if (!window.userRoles || (!window.userRoles.isAdmin && !window.userRoles.isGestor)) {
+        $('#cita-firma-tab-li').hide();
+        if ($('#cita-firma-tab').hasClass('active')) {
+            $('#datos-generales-tab').tab('show');
+        }
+        return;
+    }
+
+    $.ajax({
+        url: 'api/evaluaciones_banco.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success && response.evaluacion_seleccionada) {
+                $('#cita-firma-tab-li').show();
+            } else {
+                $('#cita-firma-tab-li').hide();
+                if ($('#cita-firma-tab').hasClass('active')) {
+                    $('#datos-generales-tab').tab('show');
+                }
+            }
+        },
+        error: function() {
+            $('#cita-firma-tab-li').hide();
+            if ($('#cita-firma-tab').hasClass('active')) {
+                $('#datos-generales-tab').tab('show');
+            }
+        }
+    });
+}
+
+$(document).on('shown.bs.tab', '#cita-firma-tab', function() {
+    const solicitudId = $('#solicitud_id').val();
+    if (solicitudId) {
+        cargarEventosCitaFirma(solicitudId);
+    }
+});
+
+function escapeHtmlEvento(str) {
+    if (str == null || str === '') return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function formatearFechaEvento(fecha) {
+    if (!fecha) return '-';
+    var p = String(fecha).substring(0, 10).split('-');
+    if (p.length === 3) return p[2] + '/' + p[1] + '/' + p[0];
+    return fecha;
+}
+
+function cargarEventosCitaFirma(solicitudId) {
+    $('#eventosCitaFirmaTableBody').html(
+        '<tr><td colspan="4" class="text-center"><div class="spinner-border spinner-border-sm" role="status"></div> Cargando eventos...</td></tr>'
+    );
+
+    $.ajax({
+        url: 'api/citas_firma.php',
+        type: 'GET',
+        data: { solicitud_id: solicitudId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                renderEventosCitaFirma(response.data || []);
+            } else {
+                $('#eventosCitaFirmaTableBody').html(
+                    '<tr><td colspan="4" class="text-center text-muted">' +
+                    escapeHtmlEvento(response.message || 'No se pudieron cargar los eventos') +
+                    '</td></tr>'
+                );
+            }
+        },
+        error: function() {
+            $('#eventosCitaFirmaTableBody').html(
+                '<tr><td colspan="4" class="text-center text-danger">Error al cargar los eventos</td></tr>'
+            );
+        }
+    });
+}
+
+function renderEventosCitaFirma(eventos) {
+    var tbody = $('#eventosCitaFirmaTableBody');
+    tbody.empty();
+
+    if (!eventos.length) {
+        tbody.html('<tr><td colspan="4" class="text-center text-muted">No hay eventos registrados</td></tr>');
+        return;
+    }
+
+    eventos.forEach(function(ev) {
+        var id = parseInt(ev.id, 10);
+        var nombre = escapeHtmlEvento(ev.nombre_evento || '(Sin nombre)');
+        var fecha = escapeHtmlEvento(formatearFechaEvento(ev.fecha_evento));
+        var comentario = escapeHtmlEvento(ev.comentario || '');
+        var comentarioHtml = comentario
+            ? '<div class="small text-break" style="max-width:360px;white-space:pre-wrap;">' + comentario + '</div>'
+            : '<span class="text-muted">—</span>';
+
+        tbody.append(
+            '<tr data-evento-id="' + id + '">' +
+                '<td>' + nombre + '</td>' +
+                '<td>' + fecha + '</td>' +
+                '<td>' + comentarioHtml + '</td>' +
+                '<td>' +
+                    '<div class="btn-group btn-group-sm">' +
+                        '<button type="button" class="btn btn-outline-primary" title="Editar" onclick="editarEventoCitaFirma(' + id + ')">' +
+                            '<i class="fas fa-edit"></i>' +
+                        '</button>' +
+                        '<button type="button" class="btn btn-outline-danger" title="Eliminar" onclick="eliminarEventoCitaFirma(' + id + ')">' +
+                            '<i class="fas fa-trash"></i>' +
+                        '</button>' +
+                    '</div>' +
+                '</td>' +
+            '</tr>'
+        );
+    });
+}
+
+function restaurarModalSolicitudTrasEvento() {
+    if ($('#solicitudModal').hasClass('show')) {
+        document.body.classList.add('modal-open');
+        if (!$('.modal-backdrop').length) {
+            $('<div class="modal-backdrop fade show"></div>').appendTo(document.body);
+        }
+    }
+}
+
+function abrirModalEventoCitaFirma(evento) {
+    var solicitudId = $('#solicitud_id').val();
+    if (!solicitudId) {
+        mostrarAlerta('Debe guardar la solicitud antes de registrar eventos', 'warning');
+        return;
+    }
+
+    $('#evento_cita_id').val(evento && evento.id ? evento.id : '');
+    $('#evento_nombre').val(evento && evento.nombre_evento ? evento.nombre_evento : '');
+    $('#evento_fecha').val(evento && evento.fecha_evento ? String(evento.fecha_evento).substring(0, 10) : '');
+    $('#evento_comentario').val(evento && evento.comentario ? evento.comentario : '');
+    $('#modalEventoCitaFirmaTitulo').text(evento && evento.id ? 'Editar Evento' : 'Agregar Evento');
+
+    var modalEl = document.getElementById('modalEventoCitaFirma');
+    var modal = bootstrap.Modal.getOrCreateInstance(modalEl, { backdrop: true, focus: true });
+    modal.show();
+}
+
+$(document).on('shown.bs.modal', '#modalEventoCitaFirma', function() {
+    var zIndex = 1065;
+    $(this).css('z-index', zIndex);
+    $('.modal-backdrop').last().css('z-index', zIndex - 1);
+});
+
+$(document).on('hidden.bs.modal', '#modalEventoCitaFirma', function() {
+    restaurarModalSolicitudTrasEvento();
+});
+
+function editarEventoCitaFirma(eventoId) {
+    $.ajax({
+        url: 'api/citas_firma.php',
+        type: 'GET',
+        data: { id: eventoId },
+        dataType: 'json',
+        success: function(response) {
+            if (response.success && response.data) {
+                abrirModalEventoCitaFirma(response.data);
+            } else {
+                mostrarAlerta(response.message || 'No se pudo cargar el evento', 'danger');
+            }
+        },
+        error: function() {
+            mostrarAlerta('Error al cargar el evento', 'danger');
+        }
+    });
+}
+
+function guardarEventoCitaFirma() {
+    var solicitudId = $('#solicitud_id').val();
+    var eventoId = $('#evento_cita_id').val();
+    var nombre = ($('#evento_nombre').val() || '').trim();
+    var fecha = ($('#evento_fecha').val() || '').trim();
+    var comentario = ($('#evento_comentario').val() || '').trim();
+
+    if (!solicitudId) {
+        mostrarAlerta('Debe guardar la solicitud antes de registrar eventos', 'warning');
+        return;
+    }
+    if (!nombre || !fecha) {
+        mostrarAlerta('Complete el nombre y la fecha del evento', 'warning');
+        return;
+    }
+
+    var $btn = $('#btnGuardarEventoCitaFirma');
+    $btn.prop('disabled', true);
+
+    var data = {
+        solicitud_id: solicitudId,
+        nombre_evento: nombre,
+        fecha_evento: fecha,
+        comentario: comentario
+    };
+    if (eventoId) {
+        data.action = 'actualizar';
+        data.id = eventoId;
+    }
+
+    $.ajax({
+        url: 'api/citas_firma.php',
+        type: 'POST',
+        data: data,
+        dataType: 'json',
+        success: function(response) {
+            $btn.prop('disabled', false);
+            if (response.success) {
+                var modalEl = document.getElementById('modalEventoCitaFirma');
+                var modal = bootstrap.Modal.getInstance(modalEl);
+                if (modal) modal.hide();
+                mostrarAlerta(response.message || 'Evento guardado', 'success');
+                cargarEventosCitaFirma(solicitudId);
+            } else {
+                mostrarAlerta(response.message || 'No se pudo guardar el evento', 'danger');
+            }
+        },
+        error: function() {
+            $btn.prop('disabled', false);
+            mostrarAlerta('Error de conexión al guardar el evento', 'danger');
+        }
+    });
+}
+
+function eliminarEventoCitaFirma(eventoId) {
+    if (!confirm('¿Eliminar este evento? Esta acción no se puede deshacer.')) {
+        return;
+    }
+
+    var solicitudId = $('#solicitud_id').val();
+    $.ajax({
+        url: 'api/citas_firma.php',
+        type: 'DELETE',
+        data: 'id=' + encodeURIComponent(eventoId),
+        contentType: 'application/x-www-form-urlencoded',
+        dataType: 'json',
+        success: function(response) {
+            if (response.success) {
+                mostrarAlerta(response.message || 'Evento eliminado', 'success');
+                cargarEventosCitaFirma(solicitudId);
+            } else {
+                mostrarAlerta(response.message || 'No se pudo eliminar el evento', 'danger');
+            }
+        },
+        error: function(xhr) {
+            var mensaje = 'Error al eliminar el evento';
+            try {
+                var err = JSON.parse(xhr.responseText);
+                if (err.message) mensaje = err.message;
+            } catch (e) {}
+            mostrarAlerta(mensaje, 'danger');
+        }
+    });
+}
+
+// Compatibilidad por si quedan referencias antiguas
+function cargarCitas(solicitudId) { cargarEventosCitaFirma(solicitudId); }
+function guardarCita() { abrirModalEventoCitaFirma(); }
+function eliminarCita(id) { eliminarEventoCitaFirma(id); }
+

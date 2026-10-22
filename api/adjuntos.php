@@ -1,0 +1,668 @@
+<?php
+/**
+ * API para gestión de adjuntos de solicitudes
+ */
+
+session_start();
+
+// Para descarga de archivo no enviar JSON ni otra salida antes de los headers del archivo
+$actionGet = $_GET['action'] ?? '';
+$esDescarga = ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
+    && (
+        (isset($_GET['id']) && in_array($actionGet, ['descargar', 'corredor_descargar'], true))
+        || ($actionGet === 'generar_resumen_pdf' && isset($_GET['solicitud_id']))
+    );
+if ($esDescarga) {
+    ob_start();
+} else {
+    header('Content-Type: application/json');
+}
+
+// Verificar si el usuario está logueado
+if (!isset($_SESSION['user_id'])) {
+    if ($esDescarga) {
+        while (ob_get_level()) ob_end_clean();
+    }
+    header('Content-Type: application/json');
+    http_response_code(401);
+    echo json_encode(['success' => false, 'message' => 'No autorizado']);
+    exit();
+}
+
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/historial_helper.php';
+require_once __DIR__ . '/../includes/OcrHelper.php';
+require_once __DIR__ . '/../includes/banco_scope_helper.php';
+require_once __DIR__ . '/../includes/sp_scope_helper.php';
+require_once __DIR__ . '/../includes/email_helper.php';
+
+$method = $_SERVER['REQUEST_METHOD'];
+
+switch ($method) {
+    case 'GET':
+        // Corredor: listar / descargar (mismo endpoint que adjuntos para evitar bloqueo WAF)
+        if ($actionGet === 'corredor_listar' && isset($_GET['solicitud_id'])) {
+            require_once __DIR__ . '/../includes/corredor_api.php';
+            asegurarTablaCorredorEnvios($pdo);
+            listarEnviosCorredor($pdo, (int) $_GET['solicitud_id']);
+            break;
+        }
+        if ($actionGet === 'corredor_descargar' && isset($_GET['id'])) {
+            require_once __DIR__ . '/../includes/corredor_api.php';
+            asegurarTablaCorredorEnvios($pdo);
+            descargarEnvioCorredor($pdo, (int) $_GET['id']);
+            break;
+        }
+        if ($actionGet === 'generar_resumen_pdf' && isset($_GET['solicitud_id'])) {
+            generarResumenSolicitudPdf((int) $_GET['solicitud_id']);
+            break;
+        }
+        if (isset($_GET['solicitud_id'])) {
+            obtenerAdjuntos($_GET['solicitud_id']);
+        } elseif (isset($_GET['id'])) {
+            if ($actionGet === 'descargar') {
+                descargarAdjunto($_GET['id']);
+            } else {
+                obtenerAdjunto($_GET['id']);
+            }
+        } else {
+            echo json_encode(['success' => false, 'message' => 'ID de solicitud requerido']);
+        }
+        break;
+        
+    case 'POST':
+        // Enviar un adjunto concreto a un usuario banco asignado
+        if (($_POST['action'] ?? '') === 'enviar_adjunto_banco') {
+            try {
+                $resultado = enviarAdjuntoActualizacionBanco(
+                    (int) ($_POST['solicitud_id'] ?? 0),
+                    (int) ($_POST['adjunto_id'] ?? 0),
+                    (int) ($_POST['usuario_banco_id'] ?? 0)
+                );
+                echo json_encode([
+                    'success' => !empty($resultado['success']),
+                    'message' => $resultado['message'] ?? (!empty($resultado['success']) ? 'Enviado' : 'No se pudo enviar'),
+                ]);
+            } catch (Throwable $e) {
+                error_log('enviar_adjunto_banco: ' . $e->getMessage());
+                http_response_code(500);
+                echo json_encode(['success' => false, 'message' => 'Error interno al enviar adjunto']);
+            }
+            break;
+        }
+        // Corredor: envío con Resend (multipart por adjuntos.php — Cloudflare bloquea el endpoint dedicado)
+        if (($_POST['action'] ?? '') === 'corredor_enviar') {
+            require_once __DIR__ . '/../includes/email_helper.php';
+            require_once __DIR__ . '/../includes/corredor_api.php';
+            asegurarTablaCorredorEnvios($pdo);
+            try {
+                enviarResumenCorredorApi($pdo);
+            } catch (Throwable $e) {
+                error_log('corredor_enviar: ' . $e->getMessage());
+                http_response_code(500);
+                echo json_encode(['success' => false, 'message' => 'Error interno al procesar Corredor']);
+            }
+            break;
+        }
+        subirAdjunto();
+        break;
+        
+    case 'DELETE':
+        if (isset($_GET['id'])) {
+            eliminarAdjunto($_GET['id']);
+        } else {
+            echo json_encode(['success' => false, 'message' => 'ID de adjunto requerido']);
+        }
+        break;
+        
+    default:
+        http_response_code(405);
+        echo json_encode(['success' => false, 'message' => 'Método no permitido']);
+        break;
+}
+
+function _tamano_col(PDO $pdo): ?string {
+    static $col = '__unset__';
+    if ($col !== '__unset__') return $col ?: null;
+
+    // Algunas instalaciones pueden tener la columna sin ñ por compatibilidad.
+    // Detectamos cuál existe en la tabla adjuntos_solicitud. Si no existe ninguna,
+    // devolvemos null para no romper INSERT/SELECT.
+    try {
+        $dbName = $pdo->query("SELECT DATABASE()")->fetchColumn();
+        if (!$dbName) {
+            $col = null;
+            return null;
+        }
+
+        $stmt = $pdo->prepare("
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_NAME = 'adjuntos_solicitud'
+              AND COLUMN_NAME IN ('tamaño_archivo', 'tamano_archivo', 'tamao_archivo')
+            LIMIT 1
+        ");
+        $stmt->execute([$dbName]);
+        $found = $stmt->fetchColumn();
+        $col = $found ?: null;
+        return $col;
+    } catch (Throwable $e) {
+        // Si por permisos o configuración no se puede leer INFORMATION_SCHEMA,
+        // no arriesgamos: asumimos que no existe.
+        error_log('Detect columna tamaño_archivo falló: ' . $e->getMessage());
+        $col = null;
+        return null;
+    }
+}
+
+/**
+ * Detecta si existe la columna texto_extraido en adjuntos_solicitud.
+ */
+function _tiene_texto_extraido(PDO $pdo): bool {
+    static $has = null;
+    if ($has !== null) {
+        return $has;
+    }
+    try {
+        $dbName = $pdo->query("SELECT DATABASE()")->fetchColumn();
+        if (!$dbName) {
+            $has = false;
+            return false;
+        }
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_NAME = 'adjuntos_solicitud'
+              AND COLUMN_NAME = 'texto_extraido'
+        ");
+        $stmt->execute([$dbName]);
+        $has = ((int)$stmt->fetchColumn()) > 0;
+    } catch (Throwable $e) {
+        error_log('Detect columna texto_extraido falló: ' . $e->getMessage());
+        $has = false;
+    }
+    return $has;
+}
+
+function obtenerAdjuntos($solicitudId) {
+    global $pdo;
+    
+    try {
+        $tamCol = _tamano_col($pdo);
+        $tamSelect = $tamCol ? "a.`$tamCol` AS `tamaño_archivo`" : "0 AS `tamaño_archivo`";
+        $textoSelect = _tiene_texto_extraido($pdo) ? "a.texto_extraido" : "NULL AS texto_extraido";
+        $stmt = $pdo->prepare("
+            SELECT
+                a.id,
+                a.solicitud_id,
+                a.usuario_id,
+                a.nombre_archivo,
+                a.nombre_original,
+                a.ruta_archivo,
+                a.tipo_archivo,
+                $tamSelect,
+                a.descripcion,
+                $textoSelect,
+                a.fecha_subida,
+                u.nombre,
+                u.apellido
+            FROM adjuntos_solicitud a
+            LEFT JOIN usuarios u ON a.usuario_id = u.id
+            WHERE a.solicitud_id = ?
+            ORDER BY a.fecha_subida DESC
+        ");
+        $stmt->execute([$solicitudId]);
+        $adjuntos = $stmt->fetchAll();
+        
+        echo json_encode(['success' => true, 'data' => $adjuntos]);
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error de base de datos']);
+    }
+}
+
+function obtenerAdjunto($id) {
+    global $pdo;
+    
+    try {
+        $tamCol = _tamano_col($pdo);
+        $tamSelect = $tamCol ? "a.`$tamCol` AS `tamaño_archivo`" : "0 AS `tamaño_archivo`";
+        $textoSelect = _tiene_texto_extraido($pdo) ? "a.texto_extraido" : "NULL AS texto_extraido";
+        $stmt = $pdo->prepare("
+            SELECT
+                a.id,
+                a.solicitud_id,
+                a.usuario_id,
+                a.nombre_archivo,
+                a.nombre_original,
+                a.ruta_archivo,
+                a.tipo_archivo,
+                $tamSelect,
+                a.descripcion,
+                $textoSelect,
+                a.fecha_subida,
+                u.nombre,
+                u.apellido
+            FROM adjuntos_solicitud a
+            LEFT JOIN usuarios u ON a.usuario_id = u.id
+            WHERE a.id = ?
+        ");
+        $stmt->execute([$id]);
+        $adjunto = $stmt->fetch();
+        
+        if ($adjunto) {
+            echo json_encode(['success' => true, 'data' => $adjunto]);
+        } else {
+            echo json_encode(['success' => false, 'message' => 'Adjunto no encontrado']);
+        }
+    } catch (PDOException $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error de base de datos']);
+    }
+}
+
+function subirAdjunto() {
+    global $pdo;
+    
+    try {
+        // Verificar que se enviaron archivos
+        if (!isset($_FILES['archivo'])) {
+            echo json_encode(['success' => false, 'message' => 'No se envió ningún archivo']);
+            return;
+        }
+        
+        $solicitudId = $_POST['solicitud_id'] ?? null;
+        $descripcion = $_POST['descripcion'] ?? '';
+        
+        if (!$solicitudId) {
+            echo json_encode(['success' => false, 'message' => 'ID de solicitud requerido']);
+            return;
+        }
+        
+        // Verificar que la solicitud existe
+        $stmt = $pdo->prepare("SELECT id FROM solicitudes_credito WHERE id = ?");
+        $stmt->execute([$solicitudId]);
+        if (!$stmt->fetch()) {
+            echo json_encode(['success' => false, 'message' => 'Solicitud no encontrada']);
+            return;
+        }
+        
+        $archivos = $_FILES['archivo'];
+        $archivosSubidos = 0;
+        $archivosFallidos = 0;
+        $errores = [];
+        $nombresSubidosOk = [];
+        
+        // Detectar si es un array de archivos o un solo archivo
+        $esArray = is_array($archivos['name']);
+        
+        if (!$esArray) {
+            // Convertir a array para simplificar el procesamiento
+            $archivos = [
+                'name' => [$archivos['name']],
+                'type' => [$archivos['type']],
+                'tmp_name' => [$archivos['tmp_name']],
+                'error' => [$archivos['error']],
+                'size' => [$archivos['size']]
+            ];
+        }
+        
+        // Validar tipo de archivo
+        $tiposPermitidos = [
+            'image/jpeg', 'image/png', 'image/gif',
+            'application/pdf',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'text/plain'
+        ];
+        
+        // Crear directorio si no existe
+        $directorio = '../adjuntos/solicitudes/';
+        if (!is_dir($directorio)) {
+            mkdir($directorio, 0755, true);
+        }
+        
+        // Procesar cada archivo
+        for ($i = 0; $i < count($archivos['name']); $i++) {
+            // Verificar errores de subida
+            if ($archivos['error'][$i] !== UPLOAD_ERR_OK) {
+                $errores[] = $archivos['name'][$i] . ': Error en la subida';
+                $archivosFallidos++;
+                continue;
+            }
+            
+            $nombreOriginal = $archivos['name'][$i];
+            $tipoArchivo = $archivos['type'][$i];
+            $tamañoArchivo = $archivos['size'][$i];
+            $tmpName = $archivos['tmp_name'][$i];
+            
+            // Validar tamaño (máximo 10MB)
+            if ($tamañoArchivo > 10 * 1024 * 1024) {
+                $errores[] = $nombreOriginal . ': Archivo demasiado grande (máximo 10MB)';
+                $archivosFallidos++;
+                continue;
+            }
+            
+            // Validar tipo de archivo
+            if (!in_array($tipoArchivo, $tiposPermitidos)) {
+                $errores[] = $nombreOriginal . ': Tipo de archivo no permitido';
+                $archivosFallidos++;
+                continue;
+            }
+            
+            // Generar nombre único para el archivo
+            $extension = pathinfo($nombreOriginal, PATHINFO_EXTENSION);
+            $nombreArchivo = uniqid() . '_' . time() . '_' . $i . '.' . $extension;
+            $rutaArchivo = $directorio . $nombreArchivo;
+            $rutaArchivoDB = 'adjuntos/solicitudes/' . $nombreArchivo;
+            
+            // Mover archivo
+            if (move_uploaded_file($tmpName, $rutaArchivo)) {
+                // Guardar en base de datos
+                $tamCol = _tamano_col($pdo);
+                if ($tamCol) {
+                    $stmt = $pdo->prepare("
+                        INSERT INTO adjuntos_solicitud 
+                        (solicitud_id, usuario_id, nombre_archivo, nombre_original, ruta_archivo, tipo_archivo, `$tamCol`, descripcion)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    $params = [
+                        $solicitudId,
+                        $_SESSION['user_id'],
+                        $nombreArchivo,
+                        $nombreOriginal,
+                        $rutaArchivoDB,
+                        $tipoArchivo,
+                        $tamañoArchivo,
+                        $descripcion
+                    ];
+                } else {
+                    $stmt = $pdo->prepare("
+                        INSERT INTO adjuntos_solicitud 
+                        (solicitud_id, usuario_id, nombre_archivo, nombre_original, ruta_archivo, tipo_archivo, descripcion)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    $params = [
+                        $solicitudId,
+                        $_SESSION['user_id'],
+                        $nombreArchivo,
+                        $nombreOriginal,
+                        $rutaArchivoDB,
+                        $tipoArchivo,
+                        $descripcion
+                    ];
+                }
+                
+                $stmt->execute($params);
+                
+                $adjuntoId = (int) $pdo->lastInsertId();
+
+                // Extraer texto por OCR / pdftotext / txt y actualizar registro (si existe columna texto_extraido)
+                try {
+                    $rutaAbsoluta = realpath($rutaArchivo) ?: (dirname(__DIR__) . '/' . $rutaArchivo);
+                    if (is_file($rutaAbsoluta) && $adjuntoId > 0) {
+                        $textoExtraido = OcrHelper::extraerTexto($rutaAbsoluta, $tipoArchivo);
+                        if ($textoExtraido !== '') {
+                            $maxLen = 1024 * 1024; // 1 MB para LONGTEXT
+                            if (strlen($textoExtraido) > $maxLen) {
+                                $textoExtraido = substr($textoExtraido, 0, $maxLen);
+                            }
+                            if (_tiene_texto_extraido($pdo)) {
+                                $up = $pdo->prepare("UPDATE adjuntos_solicitud SET texto_extraido = ? WHERE id = ?");
+                                $up->execute([$textoExtraido, $adjuntoId]);
+                            }
+                        }
+                    }
+                } catch (Throwable $e) {
+                    error_log('OCR adjunto: ' . $e->getMessage());
+                }
+                
+                $descHistorial = 'Se agregó el documento: ' . $nombreOriginal . ($descripcion ? ' - ' . $descripcion : '');
+                registrarHistorialSolicitud($pdo, $solicitudId, $_SESSION['user_id'], 'documento_agregado', $descHistorial, null, null);
+                
+                $archivosSubidos++;
+                $nombresSubidosOk[] = $nombreOriginal;
+            } else {
+                $errores[] = $nombreOriginal . ': Error al guardar el archivo';
+                $archivosFallidos++;
+            }
+        }
+        
+        // Preparar respuesta
+        if ($archivosSubidos > 0) {
+            // Si sube un usuario banco → notificar gestor (CC F&I + Pipe)
+            $userRoles = $_SESSION['user_roles'] ?? [];
+            if (!is_array($userRoles)) {
+                $userRoles = [];
+            }
+            if (motus_es_vista_banco($userRoles) && !empty($nombresSubidosOk)) {
+                try {
+                    enviarNotificacionAdjuntoBanco((int) $solicitudId, $nombresSubidosOk, (string) $descripcion);
+                } catch (Throwable $e) {
+                    error_log('adjunto banco mail: ' . $e->getMessage());
+                }
+            }
+
+            $mensaje = $archivosSubidos . ' archivo(s) subido(s) correctamente';
+            if ($archivosFallidos > 0) {
+                $mensaje .= '. ' . $archivosFallidos . ' archivo(s) fallaron';
+            }
+            
+            echo json_encode([
+                'success' => true,
+                'message' => $mensaje,
+                'data' => [
+                    'count' => $archivosSubidos,
+                    'failed' => $archivosFallidos,
+                    'errors' => $errores
+                ]
+            ]);
+        } else {
+            echo json_encode([
+                'success' => false,
+                'message' => 'No se pudo subir ningún archivo',
+                'errors' => $errores
+            ]);
+        }
+        
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+function eliminarAdjunto($id) {
+    global $pdo;
+    
+    try {
+        // Obtener información del adjunto
+        $stmt = $pdo->prepare("SELECT * FROM adjuntos_solicitud WHERE id = ?");
+        $stmt->execute([$id]);
+        $adjunto = $stmt->fetch();
+        
+        if (!$adjunto) {
+            echo json_encode(['success' => false, 'message' => 'Adjunto no encontrado']);
+            return;
+        }
+        
+        // Verificar permisos (solo el usuario que subió el archivo o admin puede eliminarlo)
+        if ($adjunto['usuario_id'] != $_SESSION['user_id'] && !in_array('ROLE_ADMIN', $_SESSION['user_roles'])) {
+            echo json_encode(['success' => false, 'message' => 'No tienes permisos para eliminar este archivo']);
+            return;
+        }
+        
+        // Eliminar archivo físico (ajustar ruta relativa desde api/)
+        $rutaArchivo = '../' . $adjunto['ruta_archivo'];
+        if (file_exists($rutaArchivo)) {
+            unlink($rutaArchivo);
+        }
+        
+        // Eliminar de base de datos
+        $stmt = $pdo->prepare("DELETE FROM adjuntos_solicitud WHERE id = ?");
+        $stmt->execute([$id]);
+        
+        echo json_encode(['success' => true, 'message' => 'Adjunto eliminado correctamente']);
+        
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+function descargarAdjunto($id) {
+    global $pdo;
+    
+    try {
+        error_log("=== DESCARGAR ADJUNTO DEBUG ===");
+        error_log("ID solicitado: " . $id);
+        
+        // Obtener información del adjunto
+        $tamCol = _tamano_col($pdo);
+        $tamSelect = $tamCol ? "`$tamCol` AS `tamaño_archivo`" : "0 AS `tamaño_archivo`";
+        $textoSelect = _tiene_texto_extraido($pdo) ? "texto_extraido" : "NULL AS texto_extraido";
+        $stmt = $pdo->prepare("
+            SELECT
+                id,
+                solicitud_id,
+                usuario_id,
+                nombre_archivo,
+                nombre_original,
+                ruta_archivo,
+                tipo_archivo,
+                $tamSelect,
+                descripcion,
+                $textoSelect,
+                fecha_subida
+            FROM adjuntos_solicitud
+            WHERE id = ?
+        ");
+        $stmt->execute([$id]);
+        $adjunto = $stmt->fetch();
+        
+        error_log("Adjunto encontrado: " . print_r($adjunto, true));
+        
+        if (!$adjunto) {
+            while (ob_get_level()) ob_end_clean();
+            http_response_code(404);
+            header('Content-Type: application/json');
+            echo json_encode(['success' => false, 'message' => 'Archivo no encontrado']);
+            return;
+        }
+        
+        // Verificar que el archivo existe (ajustar ruta relativa desde api/)
+        $rutaArchivo = '../' . $adjunto['ruta_archivo'];
+        if (!file_exists($rutaArchivo)) {
+            while (ob_get_level()) ob_end_clean();
+            http_response_code(404);
+            header('Content-Type: application/json');
+            echo json_encode(['success' => false, 'message' => 'El archivo no existe en el servidor: ' . $rutaArchivo]);
+            return;
+        }
+        
+        // Descartar cualquier salida previa (buffers iniciados en este script o en includes)
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        
+        // Content-Length desde el archivo real (más fiable que solo la BD)
+        $tamano = filesize($rutaArchivo);
+        $tipo = $adjunto['tipo_archivo'] ?: 'application/octet-stream';
+        $nombreOriginal = $adjunto['nombre_original'];
+        // Evitar que comillas o backslash rompan el header
+        $nombreSeguro = str_replace(['"', '\\'], ['_', '_'], $nombreOriginal);
+        
+        header('Content-Type: ' . $tipo);
+        header('Content-Disposition: attachment; filename="' . $nombreSeguro . '"');
+        header('Content-Length: ' . $tamano);
+        header('Cache-Control: must-revalidate');
+        header('Pragma: public');
+        
+        readfile($rutaArchivo);
+        exit();
+        
+    } catch (Exception $e) {
+        while (ob_get_level()) ob_end_clean();
+        http_response_code(500);
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+    }
+}
+
+/**
+ * Genera y descarga PDF con el mismo resumen que se envía al banco por correo.
+ */
+function generarResumenSolicitudPdf(int $solicitudId): void
+{
+    global $pdo;
+
+    $fail = static function (int $code, string $msg): void {
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        http_response_code($code);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => $msg]);
+        exit();
+    };
+
+    if ($solicitudId <= 0) {
+        $fail(400, 'Solicitud no válida');
+    }
+
+    $roles = $_SESSION['user_roles'] ?? [];
+    if (!is_array($roles)) {
+        $roles = [];
+    }
+    $puede = in_array('ROLE_ADMIN', $roles, true)
+        || in_array('ROLE_GESTOR', $roles, true)
+        || motus_es_vista_banco($roles)
+        || in_array('ROLE_VENDEDOR', $roles, true)
+        || (function_exists('motus_es_vista_sp') && motus_es_vista_sp($roles));
+    if (!$puede) {
+        $fail(403, 'Acceso denegado');
+    }
+
+    try {
+        $html = construirHtmlResumenSolicitudPdf($pdo, $solicitudId);
+        if ($html === null) {
+            $fail(404, 'Solicitud no encontrada');
+        }
+
+        $vendorAutoload = __DIR__ . '/../vendor/autoload.php';
+        if (!file_exists($vendorAutoload)) {
+            $fail(500, 'Falta vendor/autoload.php (composer install)');
+        }
+        require_once $vendorAutoload;
+        if (!class_exists('Dompdf\Dompdf')) {
+            $fail(500, 'Dompdf no está instalado');
+        }
+
+        $dompdf = new \Dompdf\Dompdf(['isRemoteEnabled' => true]);
+        $dompdf->loadHtml($html, 'UTF-8');
+        $dompdf->setPaper('A4', 'portrait');
+        $dompdf->render();
+
+        $st = $pdo->prepare('SELECT nombre_cliente FROM solicitudes_credito WHERE id = ? LIMIT 1');
+        $st->execute([$solicitudId]);
+        $cliente = trim((string) ($st->fetchColumn() ?: 'Solicitud'));
+        $clienteSafe = preg_replace('/[^a-zA-Z0-9_-]+/', '_', $cliente) ?: 'Cliente';
+        $nombreArchivo = 'Resumen_Solicitud_' . $solicitudId . '_' . substr($clienteSafe, 0, 60) . '.pdf';
+
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: attachment; filename="' . $nombreArchivo . '"');
+        header('Cache-Control: private, max-age=0, must-revalidate');
+        header('Pragma: public');
+        echo $dompdf->output();
+        exit();
+    } catch (Throwable $e) {
+        error_log('generarResumenSolicitudPdf: ' . $e->getMessage());
+        $fail(500, 'Error al generar el PDF del resumen');
+    }
+}

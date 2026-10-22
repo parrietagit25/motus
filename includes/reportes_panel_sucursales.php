@@ -1,0 +1,201 @@
+﻿<?php
+/** Panel Rep. Sucursales — incluir desde reportes.php */
+$panelSucVisible = ($submenu ?? '') === 'sucursales';
+$sucDesdeDefault = (new DateTimeImmutable('first day of this month'))->format('Y-m-d');
+$sucHastaDefault = (new DateTimeImmutable('today'))->format('Y-m-d');
+?>
+<div id="panel-sucursales" class="report-panel" style="display: <?php echo $panelSucVisible ? 'block' : 'none'; ?>;">
+    <ul class="nav nav-tabs mb-3" id="sucTabsFuente" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" type="button" role="tab" data-suc-fuente="credito" id="sucTabCredito">
+                Solicitudes de crédito
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-suc-fuente="financiamiento" id="sucTabFinanciamiento">
+                Sol. Financiamiento
+            </button>
+        </li>
+    </ul>
+    <div class="alert alert-secondary small mb-3">
+        <strong>Siglas:</strong> CH, CV, TBM, VIS, BDC = agentes · SP-CH, SP-CV, SP-TBM, SP-VIS, SP-BDC = supervisores · SP-NN = supervisor nacional.
+        El total del supervisor es la suma de solicitudes de los agentes de su sucursal.
+        Todos los indicadores y gráficas usan el rango de fechas seleccionado.
+        <span id="sucFuenteNotaFin" class="d-none"> En Sol. Financiamiento, «Solo Sol. Financiamiento» son envíos del formulario público aún sin solicitud Motus vinculada.</span>
+    </div>
+    <div class="card mb-3">
+        <div class="card-body">
+            <form id="formSucFiltros" action="#" method="get" autocomplete="off">
+                <div class="row g-2 align-items-end">
+                    <div class="col-md-2">
+                        <label class="form-label small mb-0" for="sucFiltroDesde">Desde</label>
+                        <input type="date" id="sucFiltroDesde" name="desde" class="form-control form-control-sm" value="<?php echo htmlspecialchars($sucDesdeDefault); ?>">
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small mb-0" for="sucFiltroHasta">Hasta</label>
+                        <input type="date" id="sucFiltroHasta" name="hasta" class="form-control form-control-sm" value="<?php echo htmlspecialchars($sucHastaDefault); ?>">
+                    </div>
+                    <div class="col-md-2">
+                        <button type="submit" class="btn btn-primary btn-sm w-100" id="btnSucFiltrar">
+                            <i class="fas fa-filter me-1"></i>Filtrar
+                        </button>
+                    </div>
+                </div>
+            </form>
+            <p class="small text-muted mb-0 mt-2" id="sucFiltrosAplicados">Filtros: —</p>
+        </div>
+    </div>
+    <div class="row g-3 mb-3">
+        <div class="col-md-2">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <div class="text-muted small" id="sucKpiTotalLabel">Total solicitudes</div>
+                    <div class="h5 mb-0" id="sucKpiTotal">0</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <div class="text-muted small">Con sucursal</div>
+                    <div class="h5 mb-0 text-primary" id="sucKpiAnio">0</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <div class="text-muted small">Agentes con actividad</div>
+                    <div class="h5 mb-0" id="sucKpiAgentes">0</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <div class="text-muted small">Tasa aprobación</div>
+                    <div class="h5 mb-0 text-success" id="sucKpiTasa">—</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <div class="text-muted small">Sucursal líder</div>
+                    <div class="h6 mb-0" id="sucKpiLider">—</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <div class="text-muted small">Sin ejecutivo</div>
+                    <div class="h5 mb-0 text-warning" id="sucKpiSinEv">0</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="row g-3 mb-3">
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-body">
+                    <h6 class="mb-2">Volumen por sucursal</h6>
+                    <div class="fin-chart-wrap"><canvas id="sucChartPieSucursal"></canvas></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-body">
+                    <h6 class="mb-2">Por estado (global)</h6>
+                    <div class="fin-chart-wrap"><canvas id="sucChartPieEstado"></canvas></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-body">
+                    <h6 class="mb-2">Top agentes</h6>
+                    <div class="fin-chart-wrap"><canvas id="sucChartBarAgentes"></canvas></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="row g-3 mb-3">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-body">
+                    <h6 class="mb-2">Línea de tiempo — solicitudes por mes y sucursal (<span id="sucAnioLabel2">rango</span>)</h6>
+                    <div class="fin-chart-wrap" style="min-height:320px"><canvas id="sucChartLineMes"></canvas></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-12">
+            <div class="card">
+                <div class="card-body">
+                    <h6 class="mb-2">Por sucursal y estado (barras apiladas)</h6>
+                    <div class="fin-chart-wrap" style="min-height:280px"><canvas id="sucChartBarSucursal"></canvas></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="card mb-3">
+        <div class="card-body">
+            <h5 class="card-title mb-3">Resumen por sucursal</h5>
+            <div class="table-responsive">
+                <table class="table table-bordered table-reportes table-sm" id="tabla-sucursal-resumen">
+                    <thead class="table-light">
+                        <tr id="sucTheadResumen">
+                            <th>Cód.</th>
+                            <th>Sucursal</th>
+                            <?php foreach ($estadosCol as $e): ?>
+                            <th class="text-center suc-th-estado"><?php echo htmlspecialchars($e); ?></th>
+                            <?php endforeach; ?>
+                            <th class="text-center">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody><tr><td colspan="9" class="text-center text-muted">Cargando…</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="card mb-3">
+        <div class="card-body">
+            <h5 class="card-title mb-3">Resumen por agente de ventas</h5>
+            <div class="table-responsive">
+                <table class="table table-bordered table-reportes table-sm" id="tabla-sucursal-agentes">
+                    <thead class="table-light">
+                        <tr id="sucTheadAgentes">
+                            <th>Agente</th>
+                            <?php foreach ($estadosCol as $e): ?>
+                            <th class="text-center suc-th-estado"><?php echo htmlspecialchars($e); ?></th>
+                            <?php endforeach; ?>
+                            <th class="text-center">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody><tr><td colspan="8" class="text-center text-muted">Cargando…</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="card mb-3">
+        <div class="card-body">
+            <h5 class="card-title mb-3">Resumen por supervisor (total de la sucursal)</h5>
+            <div class="table-responsive">
+                <table class="table table-bordered table-reportes table-sm" id="tabla-sucursal-supervisores">
+                    <thead class="table-light">
+                        <tr id="sucTheadSupervisores">
+                            <th>Supervisor</th>
+                            <th>Sucursal</th>
+                            <?php foreach ($estadosCol as $e): ?>
+                            <th class="text-center suc-th-estado"><?php echo htmlspecialchars($e); ?></th>
+                            <?php endforeach; ?>
+                            <th class="text-center">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody><tr><td colspan="9" class="text-center text-muted">Cargando…</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>

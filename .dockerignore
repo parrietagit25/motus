@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+adjuntos/*
+logs/*
+vendor
+*.sql
+*.sql.gz
+**/*.log
+*.bak
+*.tar
+HISTORIAL_TAREAS.md
