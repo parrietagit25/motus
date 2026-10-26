@@ -192,11 +192,21 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
                         <div class="card">
                             <div class="card-body">
                                 <h5 class="card-title mb-3">Total de solicitudes por vendedor y estado</h5>
-                                <div class="row g-2 mb-3">
-                                    <div class="col-md-5">
+                                <div class="row g-2 mb-3 align-items-end">
+                                    <div class="col-md-3">
+                                        <label class="form-label small mb-0" for="filtroVendedoresTexto">Vendedor</label>
                                         <input type="text" id="filtroVendedoresTexto" class="form-control form-control-sm" placeholder="Filtrar por nombre o email...">
                                     </div>
-                                    <div class="col-md-3">
+                                    <div class="col-md-2">
+                                        <label class="form-label small mb-0" for="filtroVendedoresDesde">Desde</label>
+                                        <input type="date" id="filtroVendedoresDesde" class="form-control form-control-sm">
+                                    </div>
+                                    <div class="col-md-2">
+                                        <label class="form-label small mb-0" for="filtroVendedoresHasta">Hasta</label>
+                                        <input type="date" id="filtroVendedoresHasta" class="form-control form-control-sm">
+                                    </div>
+                                    <div class="col-md-2">
+                                        <label class="form-label small mb-0" for="filtroVendedoresEstado">Estado</label>
                                         <select id="filtroVendedoresEstado" class="form-select form-select-sm">
                                             <option value="">Todos los estados</option>
                                             <?php foreach ($estadosCol as $e): ?>
@@ -204,8 +214,9 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
                                             <?php endforeach; ?>
                                         </select>
                                     </div>
-                                    <div class="col-md-2">
-                                        <input type="number" min="0" id="filtroVendedoresMinTotal" class="form-control form-control-sm" placeholder="Total mín.">
+                                    <div class="col-md-1">
+                                        <label class="form-label small mb-0" for="filtroVendedoresMinTotal">Total mín.</label>
+                                        <input type="number" min="0" id="filtroVendedoresMinTotal" class="form-control form-control-sm" placeholder="0">
                                     </div>
                                     <div class="col-md-2">
                                         <button type="button" class="btn btn-primary btn-sm w-100" id="btnFiltrarVendedores"><i class="fas fa-filter me-1"></i>Filtrar</button>
@@ -1037,8 +1048,21 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
             .catch(() => { document.querySelector('#tabla-usuarios tbody').innerHTML = '<tr><td colspan="9" class="text-center text-danger">Error al cargar</td></tr>'; });
     }
 
+    function vendedoresFechasQuery() {
+        const desde = ((document.getElementById('filtroVendedoresDesde') || {}).value || '').trim();
+        const hasta = ((document.getElementById('filtroVendedoresHasta') || {}).value || '').trim();
+        let qs = '';
+        if (desde) qs += '&desde=' + encodeURIComponent(desde);
+        if (hasta) qs += '&hasta=' + encodeURIComponent(hasta);
+        return qs;
+    }
+
     function loadReporteVendedores() {
-        fetch('api/reportes.php?action=reporte_vendedores')
+        const qs = vendedoresFechasQuery();
+        const ex = document.getElementById('btnExportReporteActual');
+        if (ex) ex.href = 'api/reportes.php?action=exportar_excel_vendedores' + qs;
+        document.querySelector('#tabla-vendedores tbody').innerHTML = '<tr><td colspan="8" class="text-center text-muted">Cargando…</td></tr>';
+        fetch('api/reportes.php?action=reporte_vendedores' + qs)
             .then(r => r.json())
             .then(data => {
                 if (!data.success) { document.querySelector('#tabla-vendedores tbody').innerHTML = '<tr><td colspan="8" class="text-center text-muted">Sin datos</td></tr>'; return; }
@@ -1054,6 +1078,7 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
                 });
                 if (!html) html = '<tr><td colspan="8" class="text-center text-muted">Sin datos</td></tr>';
                 document.querySelector('#tabla-vendedores tbody').innerHTML = html;
+                aplicarFiltroVendedores();
                 document.querySelectorAll('.total-click-vendedor').forEach(el => {
                     el.addEventListener('click', function() {
                         const vendedorId = this.getAttribute('data-vendedor-id');
@@ -1092,7 +1117,7 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
         document.getElementById('modalSolicitudesBody').innerHTML = '<tr><td colspan="6" class="text-center">Cargando…</td></tr>';
         const modal = new bootstrap.Modal(document.getElementById('modalSolicitudesUsuario'));
         modal.show();
-        fetch('api/reportes.php?action=solicitudes_vendedor_estado&vendedor_id=' + encodeURIComponent(vendedorId) + '&estado=' + encodeURIComponent(estado))
+        fetch('api/reportes.php?action=solicitudes_vendedor_estado&vendedor_id=' + encodeURIComponent(vendedorId) + '&estado=' + encodeURIComponent(estado) + vendedoresFechasQuery())
             .then(r => r.json())
             .then(data => {
                 if (!data.success) {
@@ -1290,7 +1315,7 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
     }
     const btnFiltrarVendedores = document.getElementById('btnFiltrarVendedores');
     if (btnFiltrarVendedores) {
-        btnFiltrarVendedores.addEventListener('click', aplicarFiltroVendedores);
+        btnFiltrarVendedores.addEventListener('click', loadReporteVendedores);
     }
     const btnFiltrarTiempo = document.getElementById('btnFiltrarTiempo');
     if (btnFiltrarTiempo) {

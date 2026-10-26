@@ -10,15 +10,22 @@ require_once __DIR__ . '/reservas_wtw_helper.php';
     <div class="card mb-3">
         <div class="card-body">
             <div class="row g-2 align-items-end">
-                <div class="col-md-2">
-                    <label class="form-label small mb-0" for="filtroWtwDesde">Última actividad desde</label>
+                <div class="col-6 col-md">
+                    <label class="form-label small mb-0" for="filtroWtwCampoFecha">Fecha por</label>
+                    <select id="filtroWtwCampoFecha" class="form-select form-select-sm">
+                        <option value="actividad">Última actividad</option>
+                        <option value="emision">Emisión de la reserva</option>
+                    </select>
+                </div>
+                <div class="col-6 col-md">
+                    <label class="form-label small mb-0" for="filtroWtwDesde">Desde</label>
                     <input type="date" id="filtroWtwDesde" class="form-control form-control-sm">
                 </div>
-                <div class="col-md-2">
+                <div class="col-6 col-md">
                     <label class="form-label small mb-0" for="filtroWtwHasta">Hasta</label>
                     <input type="date" id="filtroWtwHasta" class="form-control form-control-sm">
                 </div>
-                <div class="col-md-2">
+                <div class="col-6 col-md">
                     <label class="form-label small mb-0" for="filtroWtwEstado">Estado</label>
                     <select id="filtroWtwEstado" class="form-select form-select-sm">
                         <option value="">Todos los estados</option>
@@ -27,17 +34,17 @@ require_once __DIR__ . '/reservas_wtw_helper.php';
                         <?php endforeach; ?>
                     </select>
                 </div>
-                <div class="col-md-2">
+                <div class="col-6 col-md">
                     <label class="form-label small mb-0" for="filtroWtwUsuario">Atendido por</label>
                     <select id="filtroWtwUsuario" class="form-select form-select-sm">
                         <option value="">Todos los usuarios</option>
                     </select>
                 </div>
-                <div class="col-md-2">
+                <div class="col-6 col-md">
                     <label class="form-label small mb-0" for="filtroWtwTexto">Buscar</label>
                     <input type="text" id="filtroWtwTexto" class="form-control form-control-sm" placeholder="Cliente, cédula, Mov ID...">
                 </div>
-                <div class="col-md-2">
+                <div class="col-6 col-md">
                     <button type="button" class="btn btn-primary btn-sm w-100" id="btnFiltrarWtw"><i class="fas fa-filter me-1"></i>Filtrar</button>
                 </div>
             </div>
@@ -76,6 +83,7 @@ require_once __DIR__ . '/reservas_wtw_helper.php';
                             <th>Última actividad</th>
                             <th>Reporte</th>
                             <th>Mov ID</th>
+                            <th>Emisión</th>
                             <th>Cliente</th>
                             <th>Vehículo</th>
                             <th class="text-center">Solicitud</th>
@@ -87,7 +95,7 @@ require_once __DIR__ . '/reservas_wtw_helper.php';
                             <th class="text-center">Ver</th>
                         </tr>
                     </thead>
-                    <tbody><tr><td colspan="12" class="text-center text-muted">Cargando…</td></tr></tbody>
+                    <tbody><tr><td colspan="13" class="text-center text-muted">Cargando…</td></tr></tbody>
                 </table>
             </div>
         </div>

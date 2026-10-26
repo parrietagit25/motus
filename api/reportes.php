@@ -174,7 +174,7 @@ function exportarReporteCsv(string $action): void {
                 $r['Desistimiento'] ?? 0,
                 $r['total'] ?? 0,
             ];
-        }, _dataReporteVendedores($pdo));
+        }, _dataReporteVendedores($pdo, ..._rangoFechasReporteUsuarios()));
         _outputXlsxDownload('reporte_vendedores.xlsx', 'Rep Vendedores', [
             'Vendedor ID', 'Nombre', 'Email', 'Nueva', 'En Revision Banco', 'Aprobada', 'Rechazada', 'Completada', 'Desistimiento', 'Total'
         ], $rows);
@@ -913,9 +913,10 @@ function _dataReporteUsuarios(PDO $pdo, ?string $desde = null, ?string $hasta = 
     return array_values($porUsuario);
 }
 
-function _dataReporteVendedores(PDO $pdo): array {
+function _dataReporteVendedores(PDO $pdo, ?string $desde = null, ?string $hasta = null): array {
     $spCodigos = reportes_sp_codigos_sesion();
     [$spSql, $spParams] = motus_sql_condicion_sucursal_codigos('ev.sucursal', $spCodigos);
+    [$fechaSql, $fechaParams] = _condFechaSolicitudUsuarios('s.fecha_creacion', $desde, $hasta);
     $sql = "
         SELECT
             ev.id AS vendedor_id,
@@ -925,19 +926,15 @@ function _dataReporteVendedores(PDO $pdo): array {
             s.estado,
             COUNT(s.id) AS total
         FROM ejecutivos_ventas ev
-        LEFT JOIN solicitudes_credito s ON s.ejecutivo_ventas_id = ev.id
+        LEFT JOIN solicitudes_credito s ON s.ejecutivo_ventas_id = ev.id {$fechaSql}
         WHERE COALESCE(ev.activo, 1) = 1
         {$spSql}
         GROUP BY ev.id, ev.nombre, ev.email, ev.sucursal, s.estado
         ORDER BY ev.nombre, s.estado
     ";
-    if ($spParams !== []) {
-        $st = $pdo->prepare($sql);
-        $st->execute($spParams);
-        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
-    } else {
-        $rows = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
-    }
+    $st = $pdo->prepare($sql);
+    $st->execute(array_merge($fechaParams, $spParams));
+    $rows = $st->fetchAll(PDO::FETCH_ASSOC);
     $porVendedor = [];
     foreach ($rows as $r) {
         $id = $r['vendedor_id'];
@@ -1325,7 +1322,7 @@ function reporteUsuarios() {
 function reporteVendedores() {
     global $pdo;
     try {
-        echo json_encode(['success' => true, 'data' => _dataReporteVendedores($pdo)]);
+        echo json_encode(['success' => true, 'data' => _dataReporteVendedores($pdo, ..._rangoFechasReporteUsuarios())]);
     } catch (PDOException $e) {
         http_response_code(500);
         echo json_encode(['success' => false, 'message' => 'Error de base de datos']);
@@ -1377,13 +1374,15 @@ function solicitudesPorVendedorEstado() {
     }
 
     try {
+        [$desde, $hasta] = _rangoFechasReporteUsuarios();
+        [$fechaSql, $fechaParams] = _condFechaSolicitudUsuarios('s.fecha_creacion', $desde, $hasta);
         $stmt = $pdo->prepare("
             SELECT s.id, s.nombre_cliente, s.cedula, s.estado, s.fecha_creacion, s.fecha_actualizacion
             FROM solicitudes_credito s
-            WHERE s.ejecutivo_ventas_id = ? AND s.estado = ?
+            WHERE s.ejecutivo_ventas_id = ? AND s.estado = ? {$fechaSql}
             ORDER BY s.fecha_creacion DESC
         ");
-        $stmt->execute([$vendedorId, $estado]);
+        $stmt->execute(array_merge([$vendedorId, $estado], $fechaParams));
         $solicitudes = $stmt->fetchAll(PDO::FETCH_ASSOC);
         echo json_encode(['success' => true, 'data' => $solicitudes]);
     } catch (PDOException $e) {

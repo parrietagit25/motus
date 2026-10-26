@@ -556,7 +556,9 @@ function reservas_wtw_sql_actividad(): string
 
 /**
  * @param array<string, mixed> $q Parámetros GET
- * @return array{desde: string, hasta: string, estado: string, usuario_id: int, texto: string}
+ * campo_fecha: 'actividad' (última actividad en la pantalla WTW) o 'emision' (fecha de emisión de la reserva).
+ *
+ * @return array{desde: string, hasta: string, campo_fecha: string, estado: string, usuario_id: int, texto: string}
  */
 function reservas_wtw_reporte_filtros(array $q): array
 {
@@ -569,6 +571,7 @@ function reservas_wtw_reporte_filtros(array $q): array
     return [
         'desde' => $fecha($q['desde'] ?? ''),
         'hasta' => $fecha($q['hasta'] ?? ''),
+        'campo_fecha' => ($q['campo_fecha'] ?? '') === 'emision' ? 'emision' : 'actividad',
         'estado' => in_array($estado, RESERVAS_WTW_ESTADOS, true) ? $estado : '',
         'usuario_id' => max(0, (int) ($q['usuario_id'] ?? 0)),
         'texto' => mb_substr(trim((string) ($q['texto'] ?? '')), 0, 100),
@@ -578,7 +581,7 @@ function reservas_wtw_reporte_filtros(array $q): array
 /**
  * Registros atendidos (con al menos una acción o nota) desde la pantalla WTW.
  *
- * @param array{desde: string, hasta: string, estado: string, usuario_id: int, texto: string} $f
+ * @param array{desde: string, hasta: string, campo_fecha: string, estado: string, usuario_id: int, texto: string} $f
  * @return list<array<string, mixed>>
  */
 function reservas_wtw_reporte(PDO $pdo, array $f): array
@@ -587,12 +590,13 @@ function reservas_wtw_reporte(PDO $pdo, array $f): array
     $act = reservas_wtw_sql_actividad();
     $where = [];
     $params = [];
+    $porEmision = ($f['campo_fecha'] ?? 'actividad') === 'emision';
     if ($f['desde'] !== '') {
-        $where[] = 'a.ultima >= ?';
-        $params[] = $f['desde'] . ' 00:00:00';
+        $where[] = $porEmision ? 'l.fecha_emision >= ?' : 'a.ultima >= ?';
+        $params[] = $porEmision ? $f['desde'] : $f['desde'] . ' 00:00:00';
     }
     if ($f['hasta'] !== '') {
-        $where[] = 'a.ultima < DATE_ADD(?, INTERVAL 1 DAY)';
+        $where[] = $porEmision ? 'l.fecha_emision <= ?' : 'a.ultima < DATE_ADD(?, INTERVAL 1 DAY)';
         $params[] = $f['hasta'];
     }
     if ($f['estado'] !== '') {

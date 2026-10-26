@@ -7,7 +7,7 @@
 
     function filtrosQuery() {
         var p = new URLSearchParams();
-        [['desde', 'filtroWtwDesde'], ['hasta', 'filtroWtwHasta'], ['estado', 'filtroWtwEstado'],
+        [['campo_fecha', 'filtroWtwCampoFecha'], ['desde', 'filtroWtwDesde'], ['hasta', 'filtroWtwHasta'], ['estado', 'filtroWtwEstado'],
             ['usuario_id', 'filtroWtwUsuario'], ['texto', 'filtroWtwTexto']].forEach(function (par) {
             var v = (document.getElementById(par[1]).value || '').trim();
             if (v) p.set(par[0], v);
@@ -45,6 +45,7 @@
             + '<td class="text-nowrap">' + esc(r.ultima) + '</td>'
             + '<td>#' + esc(r.reporte_id) + ' <small class="text-muted">' + esc(r.reporte_archivo) + '</small></td>'
             + '<td>' + esc(r.mov_id) + '</td>'
+            + '<td class="text-nowrap">' + esc(r.fecha_emision) + '</td>'
             + '<td>' + esc(r.nombre_cliente) + '<div class="small text-muted">' + esc(r.cedula) + '</div></td>'
             + '<td>' + esc(R.vehiculoTexto(r)) + '</td>'
             + '<td class="text-center">' + sol + '</td>'
@@ -62,12 +63,12 @@
         var ex = document.getElementById('btnExportReporteActual');
         if (ex) ex.href = 'api/reportes.php?action=exportar_excel_wtw' + qs;
         var tbody = document.querySelector('#tabla-wtw tbody');
-        tbody.innerHTML = '<tr><td colspan="12" class="text-center text-muted">Cargando…</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="13" class="text-center text-muted">Cargando…</td></tr>';
         fetch('api/reportes.php?action=reporte_wtw' + qs, { credentials: 'same-origin' })
             .then(function (r) { return r.json(); })
             .then(function (res) {
                 if (!res.success) {
-                    tbody.innerHTML = '<tr><td colspan="12" class="text-center text-danger">' + esc(res.message || 'Error al cargar el reporte') + '</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="13" class="text-center text-danger">' + esc(res.message || 'Error al cargar el reporte') + '</td></tr>';
                     pintarKpis(null);
                     return;
                 }
@@ -77,10 +78,10 @@
                 document.getElementById('wtwConteo').textContent = '(' + filas.length + ')';
                 tbody.innerHTML = filas.length
                     ? filas.map(fila).join('')
-                    : '<tr><td colspan="12" class="text-center text-muted">No hay reservas atendidas con estos filtros.</td></tr>';
+                    : '<tr><td colspan="13" class="text-center text-muted">No hay reservas atendidas con estos filtros.</td></tr>';
             })
             .catch(function () {
-                tbody.innerHTML = '<tr><td colspan="12" class="text-center text-danger">Error de conexión</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="13" class="text-center text-danger">Error de conexión</td></tr>';
             });
     }
 
