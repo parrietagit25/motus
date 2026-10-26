@@ -1,6 +1,6 @@
 # Backups automáticos (Motus)
 
-> El script lee `MYSQL_DATABASE` y `MYSQL_ROOT_PASSWORD` de `/root/baes/.env`. No escriba contraseñas en comandos, documentación ni crontab.
+> El script lee `MYSQL_DATABASE` y `MYSQL_ROOT_PASSWORD` de `ENV_FILE` (por defecto `/root/.motus/mysql_root.env`, archivo 600 en un directorio 700, fuera del bind mount de PHP). La contraseña se pasa a `mysqldump` por stdin: no aparece en la lista de procesos ni en los logs. No escriba contraseñas en comandos, documentación ni crontab.
 
 ## 1) Subir scripts al servidor
 
@@ -49,7 +49,7 @@ crontab -e
 Agregar línea:
 
 ```cron
-30 3 * * * BACKUP_DIR=/root/backups/motus_db RETENTION_DAYS=14 /root/baes/database/backup_mysql_motus.sh >> /root/backups/motus_db/cron.log 2>&1
+30 3 * * * ENV_FILE=/root/.motus/mysql_root.env BACKUP_DIR=/root/backups/motus_db RETENTION_DAYS=14 /root/baes/database/backup_mysql_motus.sh >> /root/backups/motus_db/cron.log 2>&1
 ```
 
 Ver cron instalado:

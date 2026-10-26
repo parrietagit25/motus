@@ -36,7 +36,7 @@ ssh motus "cd /root/baes && git pull"
 ```text
 MYSQL_USER=motus_user
 MYSQL_PASSWORD=<en /root/baes/.env del servidor; nunca en Git>
-MYSQL_ROOT_PASSWORD=<en /root/baes/.env del servidor; nunca en Git>
+MYSQL_ROOT_PASSWORD=<solo en /root/.motus/mysql_root.env (600, fuera del bind mount); nunca en .env ni en Git>
 MYSQL_DATABASE=motus_baes
 ```
 
@@ -44,7 +44,7 @@ Consulta típica:
 
 ```bash
 scp archivo.sql motus:/tmp/q.sql
-ssh motus 'cd /root/baes && P=$(grep ^MYSQL_PASSWORD= .env | cut -d= -f2-) && docker exec -i -e MYSQL_PWD="$P" motus_db mysql -umotus_user motus_baes < /tmp/q.sql'
+ssh motus 'cd /root/baes && { grep ^MYSQL_PASSWORD= .env | cut -d= -f2-; cat /tmp/q.sql; } | docker exec -i motus_db sh -c "read -r P; MYSQL_PWD=\"\$P\" exec mysql -umotus_user motus_baes"'
 ```
 
 ---

@@ -6,7 +6,10 @@ set -euo pipefail
 # - Genera dump .sql.gz + checksum .sha256 solo si el dump terminó completo.
 # - Si falla, no toca los respaldos anteriores ni ejecuta la limpieza por retención.
 
-ENV_FILE="${ENV_FILE:-/root/baes/.env}"
+# Credencial root protegida (fuera del bind mount); /root/baes/.env solo como compatibilidad.
+if [[ -z "${ENV_FILE:-}" ]]; then
+  if [[ -f /root/.motus/mysql_root.env ]]; then ENV_FILE=/root/.motus/mysql_root.env; else ENV_FILE=/root/baes/.env; fi
+fi
 DB_CONTAINER="${DB_CONTAINER:-motus_db}"
 BACKUP_DIR="${BACKUP_DIR:-/root/backups/motus_db}"
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
@@ -50,7 +53,8 @@ fallar() {
   [[ -n "${DB_PASS}" ]] || fallar "Contraseña vacía (revise ${ENV_FILE})."
 
   # Dump consistente para InnoDB; la contraseña va por variable de entorno, no por argumento.
-  if ! docker exec -e MYSQL_PWD="${DB_PASS}" "${DB_CONTAINER}" mysqldump \
+  # La contraseña entra por stdin: no aparece en la lista de procesos.
+  if ! printf '%s\n' "${DB_PASS}" | docker exec -i "${DB_CONTAINER}" sh -c 'read -r P; MYSQL_PWD="$P" exec mysqldump "$@"' mysqldump \
       -u"${DB_USER}" \
       --single-transaction \
       --routines \
