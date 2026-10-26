@@ -19,6 +19,14 @@ if (!$puedeReportes) {
     exit();
 }
 
+if (in_array($action, ['reporte_wtw', 'reporte_wtw_detalle', 'exportar_excel_wtw'], true)
+    && !in_array('ROLE_ADMIN', $roles, true) && !in_array('ROLE_GESTOR', $roles, true)) {
+    http_response_code(403);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['success' => false, 'message' => 'Acceso denegado']);
+    exit();
+}
+
 require_once __DIR__ . '/../config/database.php';
 
 /** Los ROLE_SP tienen acceso global a reportes; no se filtran por sucursal. */
@@ -43,6 +51,7 @@ if (in_array($action, [
     'exportar_excel_fin_enlazada',
     'exportar_excel_vehiculos',
     'exportar_excel_sucursales',
+    'exportar_excel_wtw',
 ], true)) {
     exportarReporteCsv($action);
     exit();
@@ -95,6 +104,12 @@ switch ($action) {
         break;
     case 'reporte_predicciones':
         reportePredicciones();
+        break;
+    case 'reporte_wtw':
+        reporteWtw();
+        break;
+    case 'reporte_wtw_detalle':
+        reporteWtwDetalle();
         break;
     case 'exportar_todos_excel':
         // Ya atendido al inicio.
@@ -388,6 +403,58 @@ function exportarReporteCsv(string $action): void {
         _outputXlsxDownload($nombreXlsx, 'Por Sucursal', $hdr, $rows);
         return;
     }
+
+    if ($action === 'exportar_excel_wtw') {
+        require_once __DIR__ . '/../includes/reservas_wtw_helper.php';
+        $rows = array_map(static function (array $r): array {
+            return [
+                $r['ultima'] ?? '', $r['primera'] ?? '', $r['reporte_archivo'] ?? '', $r['mov_id'] ?? '', $r['fecha_emision'] ?? '',
+                $r['nombre_sucursal'] ?? '', $r['nombre_cliente'] ?? '', $r['cedula'] ?? '',
+                trim(implode(' ', array_filter([(string) ($r['marca'] ?? ''), (string) ($r['modelo'] ?? ''), (string) ($r['anio'] ?? '')]))),
+                $r['precio_total'] ?? '', $r['solicitud_id'] ?? '', $r['estado_wtw'] ?? '', $r['propuestas_enviadas'] ?? 0,
+                $r['cambios_estado'] ?? 0, $r['ultimo_correo'] ?? '', $r['notas'] ?? 0, $r['ultima_nota'] ?? '', $r['atendido_por'] ?? '',
+            ];
+        }, reservas_wtw_reporte($pdo, reservas_wtw_reporte_filtros($_GET)));
+        _outputXlsxDownload('reporte_wtw.xlsx', 'Reporte WTW', [
+            'Ultima actividad', 'Primera actividad', 'Reporte', 'Mov ID', 'Fecha emision', 'Sucursal', 'Cliente', 'Cedula', 'Vehiculo',
+            'Precio total', 'Solicitud', 'Estado', 'Propuestas enviadas', 'Cambios de estado', 'Ultimo correo', 'Notas', 'Ultima nota', 'Atendido por',
+        ], $rows);
+        return;
+    }
+}
+
+function reporteWtw(): void {
+    global $pdo;
+    require_once __DIR__ . '/../includes/reservas_wtw_helper.php';
+    try {
+        $rows = reservas_wtw_reporte($pdo, reservas_wtw_reporte_filtros($_GET));
+        $resumen = ['total' => count($rows), 'propuestas' => 0, 'notas' => 0];
+        foreach (RESERVAS_WTW_ESTADOS as $e) {
+            $resumen[$e] = 0;
+        }
+        foreach ($rows as $r) {
+            $resumen[$r['estado_wtw']] = ($resumen[$r['estado_wtw']] ?? 0) + 1;
+            $resumen['propuestas'] += (int) $r['propuestas_enviadas'];
+            $resumen['notas'] += (int) $r['notas'];
+        }
+        echo json_encode(['success' => true, 'data' => $rows, 'resumen' => $resumen, 'usuarios' => reservas_wtw_reporte_usuarios($pdo)]);
+    } catch (Throwable $e) {
+        error_log('reporteWtw: ' . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Error al generar el reporte']);
+    }
+}
+
+function reporteWtwDetalle(): void {
+    global $pdo;
+    require_once __DIR__ . '/../includes/reservas_wtw_helper.php';
+    $det = reservas_wtw_detalle($pdo, (int) ($_GET['linea_id'] ?? 0));
+    if ($det === null) {
+        http_response_code(404);
+        echo json_encode(['success' => false, 'message' => 'Registro no encontrado']);
+        return;
+    }
+    echo json_encode(['success' => true, 'data' => $det]);
 }
 
 function _outputXlsxDownload(string $fileName, string $sheetName, array $headers, array $rows): void {

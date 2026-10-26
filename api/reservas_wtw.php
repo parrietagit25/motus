@@ -1,8 +1,8 @@
 <?php
 /**
  * API de la pantalla WTW de reservas (ROLE_WTW / ROLE_ADMIN).
- * GET  ?action=lineas&reporte_id=N | ?action=detalle&linea_id=N
- * POST action=enviar_propuesta (multipart) | action=cambiar_estado   — requieren csrf_token
+ * GET  ?action=lineas&reporte_id=N | ?action=detalle&linea_id=N | ?action=notas&linea_id=N
+ * POST action=enviar_propuesta (multipart) | cambiar_estado | nota_crear | nota_editar | nota_eliminar — requieren csrf_token
  */
 session_start();
 header('Content-Type: application/json; charset=utf-8');
@@ -30,6 +30,7 @@ if (!isset($pdo) || !($pdo instanceof PDO)) {
 }
 
 $usuarioId = (int) $_SESSION['user_id'];
+$esAdmin = in_array('ROLE_ADMIN', $roles, true);
 $metodo = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $action = (string) ($metodo === 'POST' ? ($_POST['action'] ?? '') : ($_GET['action'] ?? ''));
 
@@ -46,6 +47,10 @@ try {
             exit;
         }
         echo json_encode(['success' => true, 'data' => $det]);
+        exit;
+    }
+    if ($metodo === 'GET' && $action === 'notas') {
+        echo json_encode(['success' => true, 'data' => reservas_wtw_listar_notas($pdo, (int) ($_GET['linea_id'] ?? 0), $usuarioId, $esAdmin)]);
         exit;
     }
 
@@ -68,6 +73,19 @@ try {
         $res = reservas_wtw_cambiar_estado($pdo, $lineaId, (string) ($_POST['estado'] ?? ''), $usuarioId, $comentario);
         if ($res['success']) {
             $res['estado'] = (string) $_POST['estado'];
+        }
+    } elseif (in_array($action, ['nota_crear', 'nota_editar', 'nota_eliminar'], true)) {
+        $notaId = (int) ($_POST['nota_id'] ?? 0);
+        $texto = (string) ($_POST['nota'] ?? '');
+        if ($action === 'nota_crear') {
+            $res = reservas_wtw_crear_nota($pdo, $lineaId, $texto, $usuarioId);
+        } elseif ($action === 'nota_editar') {
+            $res = reservas_wtw_editar_nota($pdo, $notaId, $lineaId, $texto, $usuarioId, $esAdmin);
+        } else {
+            $res = reservas_wtw_eliminar_nota($pdo, $notaId, $lineaId, $usuarioId, $esAdmin);
+        }
+        if ($res['success']) {
+            $res['notas'] = reservas_wtw_listar_notas($pdo, $lineaId, $usuarioId, $esAdmin);
         }
     } else {
         http_response_code(400);

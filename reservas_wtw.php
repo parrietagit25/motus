@@ -206,10 +206,43 @@ function h($s): string
     </div>
 </div>
 
+<!-- Modal notas -->
+<div class="modal fade" id="modalWtwNotas" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="fas fa-sticky-note me-2"></i>Notas</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button>
+            </div>
+            <div class="modal-body">
+                <p class="small text-muted mb-3" id="wtwNotasResumen"></p>
+                <div id="wtwNotasLista" class="mb-3"></div>
+                <form id="formWtwNota" class="border-top pt-3" novalidate>
+                    <input type="hidden" name="action" id="wtwNotaAccion" value="nota_crear">
+                    <input type="hidden" name="csrf_token" value="<?php echo h($csrf); ?>">
+                    <input type="hidden" name="linea_id" id="wtwNotaLinea">
+                    <input type="hidden" name="nota_id" id="wtwNotaId">
+                    <label for="wtwNotaTexto" class="form-label" id="wtwNotaEtiqueta">Nueva nota</label>
+                    <textarea class="form-control" id="wtwNotaTexto" name="nota" rows="3" maxlength="2000" required></textarea>
+                    <div class="alert alert-danger small mt-2 mb-0 d-none" id="wtwNotaError"></div>
+                    <div class="d-flex justify-content-end gap-2 mt-2">
+                        <button type="button" class="btn btn-outline-secondary d-none" id="btnWtwNotaCancelar">Cancelar edición</button>
+                        <button type="submit" class="btn btn-warning" id="btnWtwNotaGuardar"><i class="fas fa-plus me-1"></i>Agregar nota</button>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
 <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
 <script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+<script src="js/reservas_wtw_render.js?v=<?php echo file_exists(__DIR__ . '/js/reservas_wtw_render.js') ? filemtime(__DIR__ . '/js/reservas_wtw_render.js') : time(); ?>"></script>
 <script src="js/reservas_wtw.js?v=<?php echo file_exists(__DIR__ . '/js/reservas_wtw.js') ? filemtime(__DIR__ . '/js/reservas_wtw.js') : time(); ?>"></script>
 </body>
 </html>

@@ -70,6 +70,22 @@ function reservas_wtw_asegurar_tablas(PDO $pdo): void
             KEY idx_wtw_hist_fecha (created_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS reservas_wtw_notas (
+            id int NOT NULL AUTO_INCREMENT,
+            linea_id int NOT NULL,
+            nota text NOT NULL,
+            usuario_id int NOT NULL,
+            created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            editado_por int DEFAULT NULL,
+            editado_at timestamp NULL DEFAULT NULL,
+            eliminado_por int DEFAULT NULL,
+            eliminado_at timestamp NULL DEFAULT NULL,
+            PRIMARY KEY (id),
+            KEY idx_wtw_notas_linea (linea_id, eliminado_at),
+            KEY idx_wtw_notas_usuario (usuario_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
     $listo = true;
 }
 
@@ -100,7 +116,8 @@ function reservas_wtw_listar_lineas(PDO $pdo, int $reporteId): array
     $stmt = $pdo->prepare("
         SELECT l.id, l.fila_excel, l.mov_id, l.fecha_emision, l.nombre_sucursal, l.nombre_cliente, l.cedula,
                l.marca, l.modelo, l.anio, l.precio_total, l.solicitud_id, l.match_por,
-               COALESCE(g.estado, 'No enviado') AS estado_wtw, g.fecha_actualizacion AS estado_wtw_fecha
+               COALESCE(g.estado, 'No enviado') AS estado_wtw, g.fecha_actualizacion AS estado_wtw_fecha,
+               (SELECT COUNT(*) FROM reservas_wtw_notas n WHERE n.linea_id = l.id AND n.eliminado_at IS NULL) AS notas
         FROM reportes_reservas_lineas l
         LEFT JOIN reservas_wtw_gestion g ON g.linea_id = l.id
         WHERE l.reporte_id = ?
@@ -226,6 +243,7 @@ function reservas_wtw_detalle(PDO $pdo, int $lineaId): ?array
     ");
     $h->execute([$lineaId]);
     $out['historial'] = $h->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    $out['notas'] = reservas_wtw_listar_notas($pdo, $lineaId);
     return $out;
 }
 
@@ -419,4 +437,234 @@ function reservas_wtw_enviar_propuesta(PDO $pdo, int $lineaId, string $email, st
         return ['success' => false, 'message' => 'No se pudo enviar el correo: ' . (string) ($res['message'] ?? 'error desconocido')];
     }
     return ['success' => true, 'message' => 'Propuesta enviada a ' . $email, 'estado' => 'Enviado'];
+}
+
+/**
+ * Notas activas de la línea. puede_modificar: autor de la nota o administrador.
+ *
+ * @return list<array<string, mixed>>
+ */
+function reservas_wtw_listar_notas(PDO $pdo, int $lineaId, int $usuarioId = 0, bool $esAdmin = false): array
+{
+    reservas_wtw_asegurar_tablas($pdo);
+    $st = $pdo->prepare("
+        SELECT n.id, n.nota, n.usuario_id, n.created_at, n.editado_at,
+               CONCAT_WS(' ', u.nombre, u.apellido) AS autor, CONCAT_WS(' ', e.nombre, e.apellido) AS editor
+        FROM reservas_wtw_notas n
+        LEFT JOIN usuarios u ON u.id = n.usuario_id
+        LEFT JOIN usuarios e ON e.id = n.editado_por
+        WHERE n.linea_id = ? AND n.eliminado_at IS NULL
+        ORDER BY n.id DESC
+    ");
+    $st->execute([$lineaId]);
+    $notas = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    foreach ($notas as &$n) {
+        $n['puede_modificar'] = $esAdmin || ($usuarioId > 0 && (int) $n['usuario_id'] === $usuarioId);
+        unset($n['usuario_id']);
+    }
+    unset($n);
+    return $notas;
+}
+
+function reservas_wtw_nota_limpia(string $nota): ?string
+{
+    $nota = trim(str_replace("\r\n", "\n", $nota));
+    if ($nota === '' || mb_strlen($nota) > 2000) {
+        return null;
+    }
+    return $nota;
+}
+
+/** @return array{success: bool, message: string} */
+function reservas_wtw_crear_nota(PDO $pdo, int $lineaId, string $nota, int $usuarioId): array
+{
+    reservas_wtw_asegurar_tablas($pdo);
+    $texto = reservas_wtw_nota_limpia($nota);
+    if ($texto === null) {
+        return ['success' => false, 'message' => 'Escriba la nota (máximo 2000 caracteres)'];
+    }
+    if (reservas_wtw_estado_linea($pdo, $lineaId) === null) {
+        return ['success' => false, 'message' => 'Registro no encontrado'];
+    }
+    $st = $pdo->prepare('INSERT INTO reservas_wtw_notas (linea_id, nota, usuario_id) VALUES (?, ?, ?)');
+    $st->execute([$lineaId, $texto, $usuarioId]);
+    return ['success' => true, 'message' => 'Nota agregada'];
+}
+
+/**
+ * Valida que la nota exista, pertenezca a la línea, siga activa y que el usuario pueda modificarla.
+ *
+ * @return array{success: bool, message: string}
+ */
+function reservas_wtw_validar_nota(PDO $pdo, int $notaId, int $lineaId, int $usuarioId, bool $esAdmin): array
+{
+    $st = $pdo->prepare('SELECT linea_id, usuario_id FROM reservas_wtw_notas WHERE id = ? AND eliminado_at IS NULL');
+    $st->execute([$notaId]);
+    $n = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$n || (int) $n['linea_id'] !== $lineaId) {
+        return ['success' => false, 'message' => 'Nota no encontrada'];
+    }
+    if (!$esAdmin && (int) $n['usuario_id'] !== $usuarioId) {
+        return ['success' => false, 'message' => 'Solo el autor de la nota puede modificarla'];
+    }
+    return ['success' => true, 'message' => 'ok'];
+}
+
+/** @return array{success: bool, message: string} */
+function reservas_wtw_editar_nota(PDO $pdo, int $notaId, int $lineaId, string $nota, int $usuarioId, bool $esAdmin): array
+{
+    reservas_wtw_asegurar_tablas($pdo);
+    $texto = reservas_wtw_nota_limpia($nota);
+    if ($texto === null) {
+        return ['success' => false, 'message' => 'Escriba la nota (máximo 2000 caracteres)'];
+    }
+    $v = reservas_wtw_validar_nota($pdo, $notaId, $lineaId, $usuarioId, $esAdmin);
+    if (!$v['success']) {
+        return $v;
+    }
+    $st = $pdo->prepare('UPDATE reservas_wtw_notas SET nota = ?, editado_por = ?, editado_at = NOW() WHERE id = ? AND eliminado_at IS NULL');
+    $st->execute([$texto, $usuarioId, $notaId]);
+    return ['success' => true, 'message' => 'Nota actualizada'];
+}
+
+/** @return array{success: bool, message: string} */
+function reservas_wtw_eliminar_nota(PDO $pdo, int $notaId, int $lineaId, int $usuarioId, bool $esAdmin): array
+{
+    reservas_wtw_asegurar_tablas($pdo);
+    $v = reservas_wtw_validar_nota($pdo, $notaId, $lineaId, $usuarioId, $esAdmin);
+    if (!$v['success']) {
+        return $v;
+    }
+    $st = $pdo->prepare('UPDATE reservas_wtw_notas SET eliminado_por = ?, eliminado_at = NOW() WHERE id = ? AND eliminado_at IS NULL');
+    $st->execute([$usuarioId, $notaId]);
+    return ['success' => true, 'message' => 'Nota eliminada'];
+}
+
+/**
+ * Actividad registrada desde la pantalla WTW: cambios de estado y envíos exitosos, y notas activas.
+ */
+function reservas_wtw_sql_actividad(): string
+{
+    return "
+        SELECT linea_id, usuario_id, created_at AS fecha FROM reservas_wtw_historial WHERE resultado = 'ok'
+        UNION ALL
+        SELECT linea_id, usuario_id, created_at FROM reservas_wtw_notas WHERE eliminado_at IS NULL
+        UNION ALL
+        SELECT linea_id, editado_por, editado_at FROM reservas_wtw_notas WHERE eliminado_at IS NULL AND editado_at IS NOT NULL
+    ";
+}
+
+/**
+ * @param array<string, mixed> $q Parámetros GET
+ * @return array{desde: string, hasta: string, estado: string, usuario_id: int, texto: string}
+ */
+function reservas_wtw_reporte_filtros(array $q): array
+{
+    $fecha = static function ($v): string {
+        $v = trim((string) $v);
+        $d = DateTime::createFromFormat('Y-m-d', $v);
+        return ($d && $d->format('Y-m-d') === $v) ? $v : '';
+    };
+    $estado = (string) ($q['estado'] ?? '');
+    return [
+        'desde' => $fecha($q['desde'] ?? ''),
+        'hasta' => $fecha($q['hasta'] ?? ''),
+        'estado' => in_array($estado, RESERVAS_WTW_ESTADOS, true) ? $estado : '',
+        'usuario_id' => max(0, (int) ($q['usuario_id'] ?? 0)),
+        'texto' => mb_substr(trim((string) ($q['texto'] ?? '')), 0, 100),
+    ];
+}
+
+/**
+ * Registros atendidos (con al menos una acción o nota) desde la pantalla WTW.
+ *
+ * @param array{desde: string, hasta: string, estado: string, usuario_id: int, texto: string} $f
+ * @return list<array<string, mixed>>
+ */
+function reservas_wtw_reporte(PDO $pdo, array $f): array
+{
+    reservas_wtw_asegurar_tablas($pdo);
+    $act = reservas_wtw_sql_actividad();
+    $where = [];
+    $params = [];
+    if ($f['desde'] !== '') {
+        $where[] = 'a.ultima >= ?';
+        $params[] = $f['desde'] . ' 00:00:00';
+    }
+    if ($f['hasta'] !== '') {
+        $where[] = 'a.ultima < DATE_ADD(?, INTERVAL 1 DAY)';
+        $params[] = $f['hasta'];
+    }
+    if ($f['estado'] !== '') {
+        $where[] = "COALESCE(g.estado, 'No enviado') = ?";
+        $params[] = $f['estado'];
+    }
+    if ($f['usuario_id'] > 0) {
+        $where[] = 'EXISTS (SELECT 1 FROM act x WHERE x.linea_id = l.id AND x.usuario_id = ?)';
+        $params[] = $f['usuario_id'];
+    }
+    if ($f['texto'] !== '') {
+        $where[] = '(l.nombre_cliente LIKE ? OR l.cedula LIKE ? OR l.mov_id LIKE ?)';
+        $like = '%' . addcslashes($f['texto'], '%_\\') . '%';
+        array_push($params, $like, $like, $like);
+    }
+    $sql = "
+        WITH act AS ($act),
+        a AS (SELECT linea_id, MIN(fecha) AS primera, MAX(fecha) AS ultima FROM act GROUP BY linea_id),
+        p AS (
+            SELECT x.linea_id, GROUP_CONCAT(DISTINCT CONCAT_WS(' ', u.nombre, u.apellido) ORDER BY u.nombre SEPARATOR ', ') AS atendido_por
+            FROM act x LEFT JOIN usuarios u ON u.id = x.usuario_id
+            GROUP BY x.linea_id
+        ),
+        h AS (
+            SELECT linea_id, SUM(accion = 'envio_propuesta') AS propuestas, SUM(accion = 'cambio_estado') AS cambios
+            FROM reservas_wtw_historial WHERE resultado = 'ok' GROUP BY linea_id
+        ),
+        n AS (SELECT linea_id, COUNT(*) AS notas FROM reservas_wtw_notas WHERE eliminado_at IS NULL GROUP BY linea_id)
+        SELECT l.id AS linea_id, l.reporte_id, r.nombre_original AS reporte_archivo, l.mov_id, l.fecha_emision,
+               l.nombre_sucursal, l.nombre_cliente, l.cedula, l.marca, l.modelo, l.anio, l.precio_total, l.solicitud_id,
+               COALESCE(g.estado, 'No enviado') AS estado_wtw, a.primera, a.ultima,
+               COALESCE(h.propuestas, 0) AS propuestas_enviadas, COALESCE(h.cambios, 0) AS cambios_estado,
+               (SELECT h2.email_destino FROM reservas_wtw_historial h2
+                 WHERE h2.linea_id = l.id AND h2.accion = 'envio_propuesta' AND h2.resultado = 'ok'
+                 ORDER BY h2.id DESC LIMIT 1) AS ultimo_correo,
+               COALESCE(n.notas, 0) AS notas,
+               (SELECT n2.nota FROM reservas_wtw_notas n2 WHERE n2.linea_id = l.id AND n2.eliminado_at IS NULL
+                 ORDER BY n2.id DESC LIMIT 1) AS ultima_nota,
+               p.atendido_por
+        FROM a
+        INNER JOIN reportes_reservas_lineas l ON l.id = a.linea_id
+        LEFT JOIN reportes_reservas r ON r.id = l.reporte_id
+        LEFT JOIN reservas_wtw_gestion g ON g.linea_id = l.id
+        LEFT JOIN h ON h.linea_id = l.id
+        LEFT JOIN n ON n.linea_id = l.id
+        LEFT JOIN p ON p.linea_id = l.id
+        " . ($where ? 'WHERE ' . implode(' AND ', $where) : '') . "
+        ORDER BY a.ultima DESC
+    ";
+    $st = $pdo->prepare($sql);
+    $st->execute($params);
+    $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    foreach ($rows as &$r) {
+        foreach (['linea_id', 'reporte_id', 'propuestas_enviadas', 'cambios_estado', 'notas'] as $k) {
+            $r[$k] = (int) $r[$k];
+        }
+    }
+    unset($r);
+    return $rows;
+}
+
+/** @return list<array{id: int, nombre: string}> Usuarios con actividad en la pantalla WTW. */
+function reservas_wtw_reporte_usuarios(PDO $pdo): array
+{
+    reservas_wtw_asegurar_tablas($pdo);
+    $act = reservas_wtw_sql_actividad();
+    $rows = $pdo->query("
+        WITH act AS ($act)
+        SELECT u.id, CONCAT_WS(' ', u.nombre, u.apellido) AS nombre
+        FROM usuarios u
+        WHERE u.id IN (SELECT usuario_id FROM act)
+        ORDER BY u.nombre, u.apellido
+    ")->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    return array_map(static fn ($r) => ['id' => (int) $r['id'], 'nombre' => (string) $r['nombre']], $rows);
 }

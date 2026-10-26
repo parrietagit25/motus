@@ -20,8 +20,13 @@ if (!in_array('ROLE_ADMIN', $_SESSION['user_roles'] ?? [], true)
 $esAdminReportes = in_array('ROLE_ADMIN', $_SESSION['user_roles'] ?? [], true);
 
 $submenu = $_GET['submenu'] ?? 'usuarios';
-if (!in_array($submenu, ['usuarios', 'vendedores', 'sucursales', 'tiempo', 'banco', 'emails', 'encuestas', 'telemetria', 'fin_publica', 'fin_enlazada', 'vehiculos', 'predicciones'], true)) {
+if (!in_array($submenu, ['usuarios', 'vendedores', 'sucursales', 'tiempo', 'banco', 'emails', 'encuestas', 'telemetria', 'fin_publica', 'fin_enlazada', 'vehiculos', 'predicciones', 'wtw'], true)) {
     $submenu = 'usuarios';
+}
+$puedeReporteWtw = $esAdminReportes || in_array('ROLE_GESTOR', $_SESSION['user_roles'] ?? [], true);
+if ($submenu === 'wtw' && !$puedeReporteWtw) {
+    header('Location: reportes.php?submenu=usuarios');
+    exit();
 }
 // Predicciones es exclusivo de administradores
 if ($submenu === 'predicciones' && !$esAdminReportes) {
@@ -44,6 +49,7 @@ $titulosReporte = [
     'fin_enlazada' => 'Sol. Pública + Motus enlazada',
     'vehiculos' => 'Rep. Vehículo (crédito)',
     'predicciones' => 'Predicciones',
+    'wtw' => 'Reporte de WTW',
 ];
 $exportActionPorSubmenu = [
     'usuarios' => ['action' => 'exportar_excel_usuarios', 'label' => 'Descargar Rep. Usuarios'],
@@ -55,6 +61,7 @@ $exportActionPorSubmenu = [
     // En encuestas se prioriza vendedores; se deja botón adicional dentro del panel para gestores.
     'encuestas' => ['action' => 'exportar_excel_encuestas_vendedores', 'label' => 'Descargar Enc. Vendedores'],
     'telemetria' => ['action' => 'exportar_excel_telemetria', 'label' => 'Descargar Rep. Telemetría'],
+    'wtw' => ['action' => 'exportar_excel_wtw', 'label' => 'Descargar Reporte de WTW'],
 ];
 $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
 ?>
@@ -117,9 +124,14 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
                             elseif ($submenu === 'fin_enlazada') echo 'Mismo análisis del formulario público, limitado a envíos que ya tienen solicitud de crédito Motus vinculada';
                             elseif ($submenu === 'vehiculos') echo 'Marcas, precios, modelo, antigüedad, kilometraje, abono e ingresos según solicitudes de crédito';
                             elseif ($submenu === 'predicciones') echo 'Riesgo de estancamiento, probabilidad de cierre y tiempo esperado de respuesta por banco (scoring estadístico)';
+                            elseif ($submenu === 'wtw') echo 'Reservas atendidas desde la pantalla WTW: propuestas enviadas, estados y notas registradas';
                             else echo 'Cantidad de correos enviados/fallidos y detalle de destinatarios';
                         ?></p>
                     </div>
+
+                    <?php if ($submenu === 'wtw'): ?>
+                    <?php include __DIR__ . '/includes/reportes_panel_wtw.php'; ?>
+                    <?php endif; ?>
 
                     <!-- Rep. Usuarios -->
                     <div id="panel-usuarios" class="report-panel" style="display: <?php echo $submenu === 'usuarios' ? 'block' : 'none'; ?>">
@@ -936,6 +948,10 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
     <?php if ($submenu === 'sucursales'): ?>
     <script src="js/reportes_sucursales.js?v=<?php echo file_exists(__DIR__ . '/js/reportes_sucursales.js') ? filemtime(__DIR__ . '/js/reportes_sucursales.js') : time(); ?>"></script>
+    <?php endif; ?>
+    <?php if ($submenu === 'wtw'): ?>
+    <script src="js/reservas_wtw_render.js?v=<?php echo file_exists(__DIR__ . '/js/reservas_wtw_render.js') ? filemtime(__DIR__ . '/js/reservas_wtw_render.js') : time(); ?>"></script>
+    <script src="js/reportes_wtw.js?v=<?php echo file_exists(__DIR__ . '/js/reportes_wtw.js') ? filemtime(__DIR__ . '/js/reportes_wtw.js') : time(); ?>"></script>
     <?php endif; ?>
     <?php if ($submenu === 'predicciones'): ?>
     <script src="js/reportes_predicciones.js?v=<?php echo file_exists(__DIR__ . '/js/reportes_predicciones.js') ? filemtime(__DIR__ . '/js/reportes_predicciones.js') : time(); ?>"></script>

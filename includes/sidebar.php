@@ -232,6 +232,11 @@ $puedeSeguimientoUsuarios = in_array((int) ($_SESSION['user_id'] ?? 0), [1, 25],
                 <i class="fas fa-bullseye me-1"></i> Predicciones
             </a>
             <?php endif; ?>
+            <?php if ($isAdmin || $isGestor): ?>
+            <a class="nav-link ps-4 py-1 small <?php echo ($reportSubmenu === 'wtw') ? 'active' : ''; ?>" href="reportes.php?submenu=wtw">
+                <i class="fas fa-clipboard-check me-1"></i> Reporte de WTW
+            </a>
+            <?php endif; ?>
             <?php endif; ?>
         </div>
         <?php endif; ?>
