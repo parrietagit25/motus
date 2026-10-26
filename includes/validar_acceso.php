@@ -30,6 +30,8 @@ $isBanco = motus_es_vista_banco($userRoles);
 $isAdminBanco = motus_es_admin_banco($userRoles);
 $isVendedor = in_array('ROLE_VENDEDOR', $userRoles);
 $isSp = motus_es_vista_sp($userRoles);
+$isWtw = in_array('ROLE_WTW', $userRoles);
+$isSoloWtw = $isWtw && !$isAdmin && !$isGestor && !$isBanco && !$isSp && !$isVendedor;
 
 // Obtener la página actual
 $current_page = basename($_SERVER['PHP_SELF']);
@@ -74,6 +76,14 @@ if ($current_page === 'monitoreo_seguridad.php') {
     $accesoPermitido = ($idAccesoEspecial === 1);
 } elseif ($current_page === 'seguimiento_usuarios.php') {
     $accesoPermitido = in_array($idAccesoEspecial, [1, 25], true);
+} elseif ($current_page === 'reservas_wtw.php') {
+    $accesoPermitido = $isWtw || $isAdmin;
+}
+
+// ROLE_WTW sin otros roles: su única pantalla es reservas_wtw.php.
+if ($isSoloWtw && $current_page !== 'reservas_wtw.php') {
+    header('Location: reservas_wtw.php');
+    exit();
 }
 
 // Si no tiene acceso, redirigir al dashboard (solo si no estamos ya en el dashboard)

@@ -16,6 +16,8 @@ $isAdminBanco = motus_es_admin_banco($_SESSION['user_roles'] ?? []);
 $isVendedor = in_array('ROLE_VENDEDOR', $_SESSION['user_roles']);
 $isSp = motus_es_vista_sp($_SESSION['user_roles'] ?? []);
 $spEtiquetaAlcance = $isSp ? motus_sp_etiqueta_alcance() : '';
+$isWtw = in_array('ROLE_WTW', $_SESSION['user_roles'] ?? [], true);
+$isSoloWtw = $isWtw && !$isAdmin && !$isGestor && !$isBanco && !$isVendedor && !$isSp;
 
 $paginasSolicitudesMenu = [
     'solicitudes.php',
@@ -23,6 +25,7 @@ $paginasSolicitudesMenu = [
     'mis_propuestas_banco.php',
     'sol_financiamiento.php',
     'subir_reporte_reservas.php',
+    'reservas_wtw.php',
 ];
 $paginasAdministracionMenu = [
     'usuarios.php',
@@ -52,10 +55,18 @@ $puedeSeguimientoUsuarios = in_array((int) ($_SESSION['user_id'] ?? 0), [1, 25],
         <h4 class="text-white"><i class="fas fa-users me-2"></i>Solicitud de Crédito</h4>
     </div>
     <nav class="nav flex-column" id="sidebarAccordion">
-        <!-- Dashboard - Visible para todos -->
+        <!-- Dashboard - Visible para todos excepto ROLE_WTW exclusivo -->
+        <?php if (!$isSoloWtw): ?>
         <a class="nav-link <?php echo ($current_page == 'dashboard.php') ? 'active' : ''; ?>" href="dashboard.php">
             <i class="fas fa-tachometer-alt me-2"></i>Dashboard
         </a>
+        <?php endif; ?>
+
+        <?php if ($isWtw && !$isAdmin): ?>
+        <a class="nav-link <?php echo ($current_page === 'reservas_wtw.php') ? 'active' : ''; ?>" href="reservas_wtw.php">
+            <i class="fas fa-clipboard-list me-2"></i>Reportes de Reservas
+        </a>
+        <?php endif; ?>
         
         <!-- Solicitudes -->
         <?php if ($isAdmin || $isGestor || $isBanco || $isVendedor || $isSp): ?>
@@ -84,6 +95,11 @@ $puedeSeguimientoUsuarios = in_array((int) ($_SESSION['user_id'] ?? 0), [1, 25],
             </a>
             <a class="nav-link ps-4 py-2 small <?php echo ($current_page === 'subir_reporte_reservas.php') ? 'active' : ''; ?>" href="subir_reporte_reservas.php">
                 <i class="fas fa-file-upload me-2"></i>Subir Reportes de Reservas
+            </a>
+            <?php endif; ?>
+            <?php if ($isAdmin): ?>
+            <a class="nav-link ps-4 py-2 small <?php echo ($current_page === 'reservas_wtw.php') ? 'active' : ''; ?>" href="reservas_wtw.php">
+                <i class="fas fa-clipboard-list me-2"></i>Reservas (WTW)
             </a>
             <?php endif; ?>
         </div>

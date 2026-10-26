@@ -102,6 +102,7 @@ if (!function_exists('motus_actividad_mapa_secciones')) {
             'mis_propuestas_banco.php' => ['seccion' => 'Solicitudes', 'etiqueta' => 'Propuestas banco'],
             'sol_financiamiento.php' => ['seccion' => 'Solicitudes', 'etiqueta' => 'Sol. Financiamiento'],
             'subir_reporte_reservas.php' => ['seccion' => 'Solicitudes', 'etiqueta' => 'Reporte reservas'],
+            'reservas_wtw.php' => ['seccion' => 'Solicitudes', 'etiqueta' => 'Reservas WTW'],
             'usuarios.php' => ['seccion' => 'Administración', 'etiqueta' => 'Usuarios'],
             'roles.php' => ['seccion' => 'Administración', 'etiqueta' => 'Roles'],
             'bancos.php' => ['seccion' => 'Administración', 'etiqueta' => 'Bancos'],
