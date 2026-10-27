@@ -194,8 +194,21 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
                                 <h5 class="card-title mb-3">Total de solicitudes por vendedor y estado</h5>
                                 <div class="row g-2 mb-3 align-items-end">
                                     <div class="col-md-3">
-                                        <label class="form-label small mb-0" for="filtroVendedoresTexto">Vendedor</label>
-                                        <input type="text" id="filtroVendedoresTexto" class="form-control form-control-sm" placeholder="Filtrar por nombre o email...">
+                                        <label class="form-label small mb-0" for="btnVendedoresSel">Vendedor</label>
+                                        <div class="dropdown" id="ddVendedores">
+                                            <button class="form-select form-select-sm text-start text-truncate" type="button" id="btnVendedoresSel"
+                                                    data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">Todos los vendedores</button>
+                                            <div class="dropdown-menu p-2 shadow" style="min-width: 300px;" aria-labelledby="btnVendedoresSel">
+                                                <input type="text" class="form-control form-control-sm mb-2" id="buscarVendedoresSel" placeholder="Buscar por nombre, email o sucursal..." autocomplete="off">
+                                                <div class="d-flex justify-content-between small mb-1">
+                                                    <a href="#" id="vendSelVisibles">Seleccionar visibles</a>
+                                                    <a href="#" id="vendSelLimpiar">Limpiar</a>
+                                                </div>
+                                                <div id="listaVendedoresSel" style="max-height: 280px; overflow-y: auto;">
+                                                    <div class="text-muted small">Cargando…</div>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                     <div class="col-md-2">
                                         <label class="form-label small mb-0" for="filtroVendedoresDesde">Desde</label>
@@ -977,6 +990,8 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
     const finPubCharts = {};
     const finEnlCharts = {};
     const vehCharts = {};
+    let vendedoresOpciones = null;
+    const vendedoresSel = new Set();
 
     if (submenu === 'usuarios') {
         loadReporteUsuarios();
@@ -1057,8 +1072,66 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
         return qs;
     }
 
+    function vendedoresQuery() {
+        return vendedoresFechasQuery() + (vendedoresSel.size ? '&vendedores=' + Array.from(vendedoresSel).join(',') : '');
+    }
+
+    function actualizarBotonVendedores() {
+        const btn = document.getElementById('btnVendedoresSel');
+        if (!btn) return;
+        if (!vendedoresSel.size) {
+            btn.textContent = 'Todos los vendedores';
+        } else if (vendedoresSel.size === 1) {
+            const v = (vendedoresOpciones || []).find(o => vendedoresSel.has(String(o.vendedor_id)));
+            btn.textContent = v ? (v.nombre || 'Vendedor') : '1 vendedor seleccionado';
+        } else {
+            btn.textContent = vendedoresSel.size + ' vendedores seleccionados';
+        }
+        btn.title = btn.textContent;
+    }
+
+    function renderOpcionesVendedores() {
+        const box = document.getElementById('listaVendedoresSel');
+        if (!box || !vendedoresOpciones) return;
+        const q = ((document.getElementById('buscarVendedoresSel') || {}).value || '').toLowerCase().trim();
+        const visibles = vendedoresOpciones.filter(o => !q || [o.nombre, o.email, o.sucursal].join(' ').toLowerCase().indexOf(q) !== -1);
+        box.innerHTML = visibles.length ? visibles.map(o => {
+            const id = String(o.vendedor_id);
+            return '<div class="form-check small">'
+                + '<input class="form-check-input vend-sel-chk" type="checkbox" value="' + escapeHtml(id) + '" id="vendSel_' + escapeHtml(id) + '"' + (vendedoresSel.has(id) ? ' checked' : '') + '>'
+                + '<label class="form-check-label" for="vendSel_' + escapeHtml(id) + '">' + escapeHtml(o.nombre || '(sin nombre)')
+                + (o.sucursal ? ' <span class="text-muted">· ' + escapeHtml(o.sucursal) + '</span>' : '') + '</label></div>';
+        }).join('') : '<div class="text-muted small">Sin coincidencias</div>';
+    }
+
+    (function initSelectorVendedores() {
+        const box = document.getElementById('listaVendedoresSel');
+        if (!box) return;
+        box.addEventListener('change', function (ev) {
+            const chk = ev.target.closest('.vend-sel-chk');
+            if (!chk) return;
+            if (chk.checked) vendedoresSel.add(chk.value); else vendedoresSel.delete(chk.value);
+            actualizarBotonVendedores();
+        });
+        const buscar = document.getElementById('buscarVendedoresSel');
+        if (buscar) buscar.addEventListener('input', renderOpcionesVendedores);
+        const todos = document.getElementById('vendSelVisibles');
+        if (todos) todos.addEventListener('click', function (ev) {
+            ev.preventDefault();
+            box.querySelectorAll('.vend-sel-chk').forEach(c => { c.checked = true; vendedoresSel.add(c.value); });
+            actualizarBotonVendedores();
+        });
+        const limpiar = document.getElementById('vendSelLimpiar');
+        if (limpiar) limpiar.addEventListener('click', function (ev) {
+            ev.preventDefault();
+            vendedoresSel.clear();
+            box.querySelectorAll('.vend-sel-chk').forEach(c => { c.checked = false; });
+            actualizarBotonVendedores();
+        });
+    })();
+
     function loadReporteVendedores() {
-        const qs = vendedoresFechasQuery();
+        const qs = vendedoresQuery();
         const ex = document.getElementById('btnExportReporteActual');
         if (ex) ex.href = 'api/reportes.php?action=exportar_excel_vendedores' + qs;
         document.querySelector('#tabla-vendedores tbody').innerHTML = '<tr><td colspan="8" class="text-center text-muted">Cargando…</td></tr>';
@@ -1066,6 +1139,10 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
             .then(r => r.json())
             .then(data => {
                 if (!data.success) { document.querySelector('#tabla-vendedores tbody').innerHTML = '<tr><td colspan="8" class="text-center text-muted">Sin datos</td></tr>'; return; }
+                if (vendedoresOpciones === null && !vendedoresSel.size) {
+                    vendedoresOpciones = (data.data || []).map(r => ({ vendedor_id: r.vendedor_id, nombre: r.nombre || '', email: r.email || '', sucursal: r.sucursal || '' }));
+                    renderOpcionesVendedores();
+                }
                 const estados = ['Nueva', 'En Revisión Banco', 'Aprobada', 'Rechazada', 'Completada', 'Desistimiento'];
                 let html = '';
                 data.data.forEach(row => {
@@ -1848,7 +1925,6 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
     }
 
     function aplicarFiltroVendedores() {
-        const txt = ((document.getElementById('filtroVendedoresTexto') || {}).value || '').toLowerCase().trim();
         const estado = ((document.getElementById('filtroVendedoresEstado') || {}).value || '').trim();
         const minRaw = ((document.getElementById('filtroVendedoresMinTotal') || {}).value || '').trim();
         const minTotal = minRaw === '' ? null : parseInt(minRaw, 10);
@@ -1857,10 +1933,8 @@ $exportActual = $exportActionPorSubmenu[$submenu] ?? null;
         filas.forEach(tr => {
             if (tr.querySelector('td[colspan]')) return;
             const celdas = tr.querySelectorAll('td');
-            const ref = (celdas[0]?.innerText || '').toLowerCase();
             const total = parseInt((celdas[7]?.innerText || '0').replace(/[^\d]/g, ''), 10) || 0;
             let visible = true;
-            if (txt && ref.indexOf(txt) === -1) visible = false;
             if (estado && mapEstado[estado] != null) {
                 const idx = mapEstado[estado];
                 const valEstado = parseInt((celdas[idx]?.innerText || '0').replace(/[^\d]/g, ''), 10) || 0;
