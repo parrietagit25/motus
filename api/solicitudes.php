@@ -303,7 +303,18 @@ function obtenerSolicitudes() {
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
         $solicitudes = $stmt->fetchAll();
-        foreach ($solicitudes as &$s) {
+        $esVistaBancoLista = motus_es_vista_banco($userRoles) && !in_array('ROLE_ADMIN', $userRoles, true);
+        $vistos = [];
+        foreach ($solicitudes as $k => &$s) {
+            if ($esVistaBancoLista) {
+                // Un banco no debe conocer otras entidades asignadas ni el comentario del gestor al seleccionar.
+                if (isset($vistos[$s['id']])) {
+                    unset($solicitudes[$k]);
+                    continue;
+                }
+                $vistos[$s['id']] = true;
+                unset($s['banco_nombre'], $s['banco_apellido'], $s['banco_institucion'], $s['comentario_seleccion_propuesta']);
+            }
             if (array_key_exists('ao_auto', $s)) {
                 $s['año_auto'] = $s['ao_auto'];
             }
@@ -314,7 +325,7 @@ function obtenerSolicitudes() {
             $s['estado_banco_class'] = $vistaBanco['class'];
         }
         unset($s);
-        echo json_encode(['success' => true, 'data' => $solicitudes]);
+        echo json_encode(['success' => true, 'data' => array_values($solicitudes)]);
         
     } catch (PDOException $e) {
         http_response_code(500);
@@ -389,6 +400,23 @@ function obtenerSolicitud($id) {
         if ($solicitud) {
             $rolesGet = $_SESSION['user_roles'] ?? [];
             if (motus_es_vista_sp($rolesGet) && !motus_solicitud_en_alcance_sp($pdo, (int) $id, $rolesGet)) {
+                http_response_code(403);
+                echo json_encode(['success' => false, 'message' => 'No tiene acceso a esta solicitud']);
+                return;
+            }
+            $esAdminGet = in_array('ROLE_ADMIN', $rolesGet, true);
+            if (!$esAdminGet && motus_es_vista_banco($rolesGet)) {
+                if (!motus_solicitud_en_alcance_banco($pdo, (int) $id, $rolesGet)) {
+                    http_response_code(403);
+                    echo json_encode(['success' => false, 'message' => 'No tiene acceso a esta solicitud']);
+                    return;
+                }
+                unset($solicitud['comentario_seleccion_propuesta']);
+            } elseif (!$esAdminGet
+                && !in_array('ROLE_GESTOR', $rolesGet, true)
+                && !in_array('ROLE_VENDEDOR', $rolesGet, true)
+                && !motus_es_vista_sp($rolesGet)
+            ) {
                 http_response_code(403);
                 echo json_encode(['success' => false, 'message' => 'No tiene acceso a esta solicitud']);
                 return;

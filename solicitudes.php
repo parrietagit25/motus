@@ -788,7 +788,8 @@ if ($isBanco && !$isAdmin) {
                                                       <?php endif; ?>
                                                   </div>
                                                   <?php else: ?>
-                                                  <span class="text-muted"><small>Propuesta seleccionada</small></span>
+                                                  <span class="badge bg-secondary" title="El criterio de aceptación se muestra en «Ver mis respuestas»">Propuesta de otra entidad seleccionada</span>
+                                                  <div class="small text-muted mt-1">Criterio en «Ver mis respuestas»</div>
                                                   <?php endif; ?>
                                               </td>
                                         </tr>
@@ -2533,11 +2534,11 @@ if ($isBanco && !$isAdmin) {
                 data: { solicitud_id: solicitudId },
                 dataType: 'json'
             }).done(function(response) {
-                if (response.success
-                    && response.evaluacion_seleccionada
+                if (response.success && (response.seleccion_otra_entidad || (
+                    response.evaluacion_seleccionada
                     && response.usuario_banco_id_seleccionado
                     && String(response.usuario_banco_id_seleccionado) !== String(window.userId || '')
-                ) {
+                ))) {
                     avisarPropuestaYaSeleccionada(
                         'Esta solicitud ya tiene una propuesta seleccionada de otra entidad bancaria. '
                         + 'Su evaluación/decisión no será procesada. Actualice la página para ver el estado actual.'
@@ -3132,6 +3133,13 @@ if ($isBanco && !$isAdmin) {
                     var evaluacionSeleccionada = response.evaluacion_seleccionada;
                     var comentarioSeleccionGlobal = response.comentario_seleccion_propuesta || '';
                     var criterioSeleccionGlobal = response.criterio_seleccion_propuesta || '';
+                    var seleccionOtraEntidad = !!response.seleccion_otra_entidad;
+                    if (seleccionOtraEntidad) {
+                        headerHtml += '<div class="alert alert-secondary py-2 small"><i class="fas fa-info-circle me-1"></i>'
+                            + 'Se seleccionó la propuesta de otra entidad para esta solicitud.'
+                            + (criterioSeleccionGlobal ? ' <strong>Criterio de aceptación:</strong> ' + escapeHtmlText(criterioSeleccionGlobal) : '')
+                            + '</div>';
+                    }
                     destruirDataTableRespuestas('#tablaRespuestasBanco');
                     if (response.data.length > 0) {
                         let html = '<div class="respuestas-banco-wrap"><table id="tablaRespuestasBanco" class="table table-striped table-hover table-bordered table-respuestas-banco">';
@@ -3163,6 +3171,8 @@ if ($isBanco && !$isAdmin) {
                             html += '<td>';
                             if (evaluacionSeleccionada && String(evaluacion.id) === String(evaluacionSeleccionada)) {
                                 html += '<span class="badge bg-success"><i class="fas fa-check-circle me-1"></i>Propuesta seleccionada</span>';
+                            } else if (seleccionOtraEntidad) {
+                                html += '<span class="badge bg-secondary">No seleccionada</span>';
                             } else if (evaluacionSeleccionada) {
                                 html += '<span class="text-muted">—</span>';
                             } else {

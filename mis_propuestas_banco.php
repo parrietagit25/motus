@@ -77,13 +77,14 @@ $esAdminBancoPagina = motus_es_admin_banco($userRoles);
                                         <th>Promoción</th>
                                         <th>Cuantía</th>
                                         <th>Seleccionada</th>
+                                        <th>Criterio de aceptación</th>
                                         <th></th>
                                     </tr>
                                 </thead>
                                 <tbody></tbody>
                             </table>
                         </div>
-                        <p class="text-muted small mb-0 mt-2">«Seleccionada» indica si el gestor/administrador eligió esa propuesta para la solicitud.</p>
+                        <p class="text-muted small mb-0 mt-2">«Seleccionada» indica si el gestor/administrador eligió esa propuesta para la solicitud. «Criterio de aceptación» muestra el criterio con el que se eligió la propuesta de la solicitud (no se indica la entidad elegida).</p>
                     </div>
                 </div>
             </div>
@@ -116,7 +117,7 @@ $esAdminBancoPagina = motus_es_admin_banco($userRoles);
         dataType: 'json'
     }).done(function (res) {
         if (!res.success) {
-            $('#tablaMisPropuestas tbody').html('<tr><td colspan="18" class="text-danger">' + esc(res.message || 'Error') + '</td></tr>');
+            $('#tablaMisPropuestas tbody').html('<tr><td colspan="19" class="text-danger">' + esc(res.message || 'Error') + '</td></tr>');
             return;
         }
         const rows = res.data || [];
@@ -179,6 +180,7 @@ $esAdminBancoPagina = motus_es_admin_banco($userRoles);
                         return d ? '<span class="badge bg-success">Sí</span>' : '<span class="badge bg-secondary">No</span>';
                     }
                 },
+                { data: 'criterio_seleccion', defaultContent: '-', render: function (d) { return esc(d || '-'); } },
                 {
                     data: 'solicitud_id',
                     orderable: false,
@@ -197,7 +199,7 @@ $esAdminBancoPagina = motus_es_admin_banco($userRoles);
             columns: cols
         });
     }).fail(function () {
-        $('#tablaMisPropuestas tbody').html('<tr><td colspan="18" class="text-danger">Error de conexión</td></tr>');
+        $('#tablaMisPropuestas tbody').html('<tr><td colspan="19" class="text-danger">Error de conexión</td></tr>');
     });
 })();
 </script>

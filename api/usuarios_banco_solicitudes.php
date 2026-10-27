@@ -23,11 +23,27 @@ if (!isset($_SESSION['user_id'])) {
 $method = $_SERVER['REQUEST_METHOD'];
 $solicitud_id = isset($_GET['solicitud_id']) ? (int)$_GET['solicitud_id'] : null;
 
+require_once __DIR__ . '/../includes/banco_scope_helper.php';
+require_once __DIR__ . '/../includes/sp_scope_helper.php';
+
+// Internos (admin, gestor, vendedor, SP) gestionan asignaciones; los bancos solo consultan las suyas.
+$rolesUbs = $_SESSION['user_roles'] ?? [];
+$esAdminUbs = in_array('ROLE_ADMIN', $rolesUbs, true);
+$esBancoUbs = !$esAdminUbs && motus_es_vista_banco($rolesUbs);
+$esInternoUbs = $esAdminUbs || (!$esBancoUbs && (
+    in_array('ROLE_GESTOR', $rolesUbs, true) || in_array('ROLE_VENDEDOR', $rolesUbs, true) || motus_es_vista_sp($rolesUbs)
+));
+if (!$esInternoUbs && !($esBancoUbs && $method === 'GET' && $solicitud_id)) {
+    http_response_code(403);
+    echo json_encode(['success' => false, 'message' => 'Acceso denegado']);
+    exit;
+}
+
 try {
     switch ($method) {
         case 'GET':
             if ($solicitud_id) {
-                obtenerUsuariosAsignados($pdo, $solicitud_id);
+                obtenerUsuariosAsignados($pdo, $solicitud_id, $esBancoUbs);
             } else {
                 buscarUsuariosBanco($pdo);
             }
@@ -57,7 +73,23 @@ try {
 /**
  * Obtener usuarios banco asignados a una solicitud
  */
-function obtenerUsuariosAsignados($pdo, $solicitud_id) {
+function obtenerUsuariosAsignados($pdo, $solicitud_id, bool $esBanco = false) {
+    $filtroBanco = '';
+    $params = [$solicitud_id];
+    if ($esBanco) {
+        if (!motus_solicitud_en_alcance_banco($pdo, (int) $solicitud_id)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Acceso denegado']);
+            return;
+        }
+        if (motus_es_admin_banco()) {
+            $filtroBanco = ' AND u.banco_id = ?';
+            $params[] = (int) motus_obtener_banco_id_usuario($pdo);
+        } else {
+            $filtroBanco = ' AND ubs.usuario_banco_id = ?';
+            $params[] = (int) $_SESSION['user_id'];
+        }
+    }
     $sql = "
         SELECT ubs.*, 
                u.nombre as usuario_nombre, 
@@ -72,12 +104,12 @@ function obtenerUsuariosAsignados($pdo, $solicitud_id) {
         JOIN usuarios u ON ubs.usuario_banco_id = u.id
         LEFT JOIN bancos b ON u.banco_id = b.id
         JOIN usuarios u_creador ON ubs.creado_por = u_creador.id
-        WHERE ubs.solicitud_id = ?
+        WHERE ubs.solicitud_id = ?{$filtroBanco}
         ORDER BY ubs.fecha_asignacion DESC
     ";
     
     $stmt = $pdo->prepare($sql);
-    $stmt->execute([$solicitud_id]);
+    $stmt->execute($params);
     $usuarios = $stmt->fetchAll();
     
     echo json_encode(['success' => true, 'data' => $usuarios]);

@@ -15,6 +15,7 @@ if (!isset($_SESSION['user_id'])) {
 
 require_once '../config/database.php';
 require_once '../includes/banco_scope_helper.php';
+require_once '../includes/sp_scope_helper.php';
 
 $exportarXlsxMisPropuestas = ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
     && !empty($_GET['mis_propuestas'])
@@ -148,6 +149,7 @@ function obtenerDatosMisPropuestasBanco(): array {
     $esAdminBanco = motus_es_admin_banco($roles);
 
     try {
+        asegurarColumnaCriterioSeleccionPropuesta($pdo);
         if ($esAdminBanco) {
             $bancoId = motus_obtener_banco_id_usuario($pdo, $uid);
             if (!$bancoId) {
@@ -162,6 +164,7 @@ function obtenerDatosMisPropuestasBanco(): array {
                     s.estado AS solicitud_estado,
                     s.evaluacion_seleccionada,
                     (s.evaluacion_seleccionada = e.id) AS es_propuesta_seleccionada,
+                    CASE WHEN s.evaluacion_seleccionada IS NOT NULL THEN s.criterio_seleccion_propuesta END AS criterio_seleccion,
                     v.marca AS vehiculo_marca,
                     v.modelo AS vehiculo_modelo,
                     v.anio AS vehiculo_anio,
@@ -187,6 +190,7 @@ function obtenerDatosMisPropuestasBanco(): array {
                     s.estado AS solicitud_estado,
                     s.evaluacion_seleccionada,
                     (s.evaluacion_seleccionada = e.id) AS es_propuesta_seleccionada,
+                    CASE WHEN s.evaluacion_seleccionada IS NOT NULL THEN s.criterio_seleccion_propuesta END AS criterio_seleccion,
                     v.marca AS vehiculo_marca,
                     v.modelo AS vehiculo_modelo,
                     v.anio AS vehiculo_anio
@@ -273,6 +277,7 @@ function exportarMisPropuestasBancoXlsx(): void {
         'Cuantía',
         'Comentarios',
         'Seleccionada',
+        'Criterio de aceptación',
     ]);
 
     $rows = [];
@@ -313,6 +318,7 @@ function exportarMisPropuestasBancoXlsx(): void {
             $r['cuantia'] !== null && $r['cuantia'] !== '' ? (float) $r['cuantia'] : '',
             (string) ($r['comentarios'] ?? ''),
             !empty($r['es_propuesta_seleccionada']) ? 'Sí' : 'No',
+            (string) ($r['criterio_seleccion'] ?? ''),
         ]);
         $rows[] = $row;
     }
@@ -326,10 +332,58 @@ function exportarMisPropuestasBancoXlsx(): void {
     exit;
 }
 
+/**
+ * Alcance de lectura de las respuestas de bancos de una solicitud.
+ * interno: admin, gestor, SP (según su alcance) y vendedor de la solicitud ven todas las respuestas.
+ * analista: solo sus respuestas en solicitudes con asignación activa.
+ * admin_banco: solo respuestas de su entidad en solicitudes asignadas a su entidad.
+ *
+ * @return array{tipo: string, usuario_id?: int, banco_id?: int}|null null = sin acceso
+ */
+function evaluaciones_alcance_lectura(PDO $pdo, int $solicitudId): ?array
+{
+    $roles = $_SESSION['user_roles'] ?? [];
+    $uid = (int) ($_SESSION['user_id'] ?? 0);
+    if ($solicitudId <= 0 || $uid <= 0) {
+        return null;
+    }
+    if (in_array('ROLE_ADMIN', $roles, true)) {
+        return ['tipo' => 'interno'];
+    }
+    if (motus_es_vista_banco($roles)) {
+        if (!motus_solicitud_en_alcance_banco($pdo, $solicitudId, $roles)) {
+            return null;
+        }
+        if (motus_es_admin_banco($roles)) {
+            $bancoId = motus_obtener_banco_id_usuario($pdo, $uid);
+            return $bancoId ? ['tipo' => 'admin_banco', 'banco_id' => $bancoId] : null;
+        }
+        return ['tipo' => 'analista', 'usuario_id' => $uid];
+    }
+    if (in_array('ROLE_GESTOR', $roles, true)) {
+        return ['tipo' => 'interno'];
+    }
+    if (motus_es_vista_sp($roles)) {
+        return motus_solicitud_en_alcance_sp($pdo, $solicitudId, $roles) ? ['tipo' => 'interno'] : null;
+    }
+    if (in_array('ROLE_VENDEDOR', $roles, true)) {
+        $st = $pdo->prepare('SELECT 1 FROM solicitudes_credito WHERE id = ? AND vendedor_id = ? LIMIT 1');
+        $st->execute([$solicitudId, $uid]);
+        return $st->fetchColumn() ? ['tipo' => 'interno'] : null;
+    }
+    return null;
+}
+
 function obtenerEvaluaciones($solicitudId, $usuarioBancoId = null) {
       global $pdo;
       
       try {
+          $alcance = evaluaciones_alcance_lectura($pdo, (int) $solicitudId);
+          if ($alcance === null) {
+              http_response_code(403);
+              echo json_encode(['success' => false, 'message' => 'No tiene acceso a las respuestas de esta solicitud']);
+              return;
+          }
           asegurarColumnaCriterioSeleccionPropuesta($pdo);
           // Primero obtener información sobre la evaluación seleccionada
           $stmt = $pdo->prepare("
@@ -370,7 +424,17 @@ function obtenerEvaluaciones($solicitudId, $usuarioBancoId = null) {
           
           $params = [$solicitudId];
           
-          if ($usuarioBancoId) {
+          if ($alcance['tipo'] === 'analista') {
+              $sql .= " AND ubs.usuario_banco_id = ?";
+              $params[] = $alcance['usuario_id'];
+          } elseif ($alcance['tipo'] === 'admin_banco') {
+              $sql .= " AND u.banco_id = ?";
+              $params[] = $alcance['banco_id'];
+              if ($usuarioBancoId) {
+                  $sql .= " AND ubs.usuario_banco_id = ?";
+                  $params[] = $usuarioBancoId;
+              }
+          } elseif ($usuarioBancoId) {
               $sql .= " AND ubs.usuario_banco_id = ?";
               $params[] = $usuarioBancoId;
           }
@@ -380,13 +444,27 @@ function obtenerEvaluaciones($solicitudId, $usuarioBancoId = null) {
           $stmt = $pdo->prepare($sql);
           $stmt->execute($params);
           $evaluaciones = $stmt->fetchAll();
+
+          $comentarioSeleccion = $solicitud['comentario_seleccion_propuesta'] ?? '';
+          $seleccionOtraEntidad = false;
+          if ($alcance['tipo'] !== 'interno' && $evaluacionSeleccionada) {
+              // Un banco no elegido solo ve el criterio de aceptación: ni el banco elegido ni el comentario del gestor.
+              $idsVisibles = array_map(static fn ($e) => (int) $e['id'], $evaluaciones);
+              if (!in_array((int) $evaluacionSeleccionada, $idsVisibles, true)) {
+                  $seleccionOtraEntidad = true;
+                  $evaluacionSeleccionada = null;
+                  $usuarioBancoIdSeleccionado = null;
+                  $comentarioSeleccion = '';
+              }
+          }
           
           echo json_encode([
               'success' => true,
               'data' => $evaluaciones,
               'evaluacion_seleccionada' => $evaluacionSeleccionada,
               'usuario_banco_id_seleccionado' => $usuarioBancoIdSeleccionado,
-              'comentario_seleccion_propuesta' => $solicitud['comentario_seleccion_propuesta'] ?? '',
+              'seleccion_otra_entidad' => $seleccionOtraEntidad,
+              'comentario_seleccion_propuesta' => $comentarioSeleccion,
               'criterio_seleccion_propuesta' => $solicitud['criterio_seleccion_propuesta'] ?? '',
               'solicitud_cliente' => [
                   'nombre_cliente' => $solicitud['nombre_cliente'] ?? '',
@@ -459,14 +537,10 @@ function guardarEvaluacion() {
         // Si el gestor ya seleccionó una propuesta de otra entidad, no procesar esta decisión.
         $stmt = $pdo->prepare("
             SELECT s.evaluacion_seleccionada,
-                   ubs.usuario_banco_id AS usuario_seleccionado_id,
-                   TRIM(CONCAT(COALESCE(u.nombre, ''), ' ', COALESCE(u.apellido, ''))) AS agente_seleccionado,
-                   b.nombre AS entidad_seleccionada
+                   ubs.usuario_banco_id AS usuario_seleccionado_id
             FROM solicitudes_credito s
             LEFT JOIN evaluaciones_banco e ON e.id = s.evaluacion_seleccionada
             LEFT JOIN usuarios_banco_solicitudes ubs ON ubs.id = e.usuario_banco_id
-            LEFT JOIN usuarios u ON u.id = ubs.usuario_banco_id
-            LEFT JOIN bancos b ON b.id = u.banco_id
             WHERE s.id = ?
             LIMIT 1
         ");
@@ -477,14 +551,11 @@ function guardarEvaluacion() {
             && !empty($bloqueo['usuario_seleccionado_id'])
             && (int)$bloqueo['usuario_seleccionado_id'] !== (int)$_SESSION['user_id']
         ) {
-            $entidad = trim((string)($bloqueo['entidad_seleccionada'] ?? ''));
-            $agente = trim((string)($bloqueo['agente_seleccionado'] ?? ''));
-            $detalle = $entidad !== '' ? $entidad : ($agente !== '' ? $agente : 'otra entidad bancaria');
             echo json_encode([
                 'success' => false,
                 'code' => 'PROPUESTA_YA_SELECCIONADA',
-                'message' => 'Esta solicitud ya tiene una propuesta seleccionada (' . $detalle . '). '
-                    . 'Su evaluación/decisión no será procesada. Actualice la página para ver el estado actual.',
+                'message' => 'Esta solicitud ya tiene una propuesta seleccionada de otra entidad. '
+                    . 'Su evaluación/decisión no será procesada. Puede ver el criterio de aceptación en «Ver mis respuestas».',
             ]);
             return;
         }
