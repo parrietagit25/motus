@@ -194,7 +194,13 @@ function rep_segfin_fetch_raw(PDO $pdo, string $d1, string $d2): array
             sc.nombre_cliente AS nombre_motus,
             sc.cedula AS cedula_motus,
             ev.nombre AS vendedor_nombre,
-            ev.sucursal AS vendedor_sucursal,
+            COALESCE(NULLIF(TRIM(ev.sucursal), ''), (
+                SELECT ev2.sucursal FROM ejecutivos_ventas ev2
+                WHERE TRIM(COALESCE(fr.email_vendedor, '')) <> ''
+                  AND LOWER(TRIM(ev2.email)) = LOWER(TRIM(fr.email_vendedor))
+                ORDER BY ev2.activo DESC, ev2.id DESC
+                LIMIT 1
+            )) AS vendedor_sucursal,
             {$sqlBancoCampos}
             {$sqlCamposReserva}
         FROM financiamiento_registros fr
@@ -234,6 +240,7 @@ function rep_segfin_enriquecer_fila(array $r): array
 
     $vNombre = trim((string) ($r['vendedor_nombre'] ?? ''));
     $e['vendedor'] = $vNombre !== '' ? $vNombre : trim((string) ($r['email_vendedor'] ?? ''));
+    $e['vendedor_sucursal'] = trim((string) ($r['vendedor_sucursal'] ?? ''));
     $e['telefono'] = trim((string) ($r['celular_cliente'] ?? ''));
     $emailForm = trim((string) ($r['cliente_correo'] ?? ''));
     $emailMotus = trim((string) ($r['solicitud_email'] ?? ''));
@@ -406,18 +413,11 @@ function rep_segfin_export_headers(): array
         'Perfil estimado',
         'Sector estimado',
         'Estado Motus',
-        '# cambios estado',
-        'Historial estados',
         'Historial notas',
         'Perfil Motus',
-        'Ingreso Motus',
-        'Género Motus',
-        'Edad Motus',
-        'Nombre Motus',
         'Cédula Motus',
-        '¿Perfil coincide?',
-        '¿Género coincide?',
         'Vendedor',
+        'Sucursal',
         '# de Telefono',
         'Unidad/ Vehículo',
         'ID Sol Digital',
@@ -461,18 +461,11 @@ function rep_segfin_export_row(array $e): array
         $e['perfil_estimado'] ?? '',
         $e['sector_estimado'] ?? '',
         $e['solicitud_estado'] ?? '',
-        $e['notas_estado_count'] ?? 0,
-        $e['estados_cambio_historial'] ?? '',
         $e['notas_estado_historial'] ?? '',
         $e['perfil_motus'] ?? '',
-        $e['ingreso_motus'] ?? '',
-        $e['genero_motus'] ?? '',
-        $e['edad_motus'] ?? '',
-        $e['nombre_motus'] ?? '',
         $e['cedula_motus'] ?? '',
-        $e['perfil_coincide_txt'] ?? '',
-        $e['genero_coincide_txt'] ?? '',
         $e['vendedor'] ?? '',
+        $e['vendedor_sucursal'] ?? '',
         $e['telefono'] ?? '',
         $e['unidad_vehiculo'] ?? '',
         $e['id_sol_digital'] ?? '',
