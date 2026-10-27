@@ -48,7 +48,7 @@ $segHasta = (new DateTimeImmutable('today'))->format('Y-m-d');
             <div class="container-fluid py-4">
                 <div class="page-header">
                     <h2 class="mb-1"><i class="fas fa-chart-line me-2"></i>Seguimiento</h2>
-                    <p class="mb-0 opacity-90">Solicitudes asignadas a su banco: respuestas enviadas y propuestas seleccionadas</p>
+                    <p class="mb-0 opacity-90">Solicitudes asignadas a su banco: respuestas enviadas, propuestas seleccionadas y efectividad de sus ejecutivos</p>
                 </div>
 
                 <div class="alert alert-info small">
@@ -132,6 +132,85 @@ $segHasta = (new DateTimeImmutable('today'))->format('Y-m-d');
                                     <canvas id="segBancoChartSeleccionadas"></canvas>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-3" id="segBancoEfectividad">
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+                            <div>
+                                <h5 class="mb-0"><i class="fas fa-user-check me-2 text-primary"></i>Efectividad por ejecutivo</h5>
+                                <small class="text-muted">Mismo rango de fechas. La decisión de cada solicitud es la última respuesta del ejecutivo; positivas = aprobado, preaprobado o aprobado condicional.</small>
+                            </div>
+                            <a href="api/reportes_banco.php?action=exportar_excel_efectividad" class="btn btn-outline-success btn-sm" id="segBancoExportEfectividad">
+                                <i class="fas fa-file-excel me-1"></i>Excel efectividad
+                            </a>
+                        </div>
+
+                        <div class="row g-2 mb-3 text-center">
+                            <?php
+                            $kpisEf = [
+                                'pct_respuesta' => ['% respuesta', 'Solicitudes respondidas / asignadas', 'text-primary'],
+                                'pct_positivas' => ['% positivas', 'Aprobadas, preaprobadas o condicionales / respondidas', 'text-success'],
+                                'pct_conversion' => ['% conversión', 'Propuestas seleccionadas / respondidas', 'text-success'],
+                                'horas_mediana' => ['1ª respuesta (mediana)', 'Horas desde la asignación', 'text-info'],
+                                'pendientes_24h' => ['Pendientes > 24 h', 'Sin respuesta, solicitud activa', 'text-danger'],
+                                'cierres' => ['Cierres', 'Seleccionadas que llegaron a Completada', 'text-dark'],
+                            ];
+                            foreach ($kpisEf as $k => [$titulo, $ayuda, $color]): ?>
+                            <div class="col-6 col-md-4 col-xl-2">
+                                <div class="border rounded p-2 h-100">
+                                    <div class="small text-muted"><?php echo htmlspecialchars($titulo); ?></div>
+                                    <div class="h4 mb-0 <?php echo $color; ?>" data-ef-kpi="<?php echo $k; ?>">—</div>
+                                    <div class="small text-muted" style="font-size:.72rem"><?php echo htmlspecialchars($ayuda); ?></div>
+                                </div>
+                            </div>
+                            <?php endforeach; ?>
+                        </div>
+
+                        <div class="row g-2 mb-3" id="segBancoDestacados"></div>
+
+                        <div class="row g-3 mb-3">
+                            <div class="col-lg-6">
+                                <h6 class="text-center">Decisiones por ejecutivo</h6>
+                                <div style="position:relative;height:300px"><canvas id="segBancoChartDecisiones"></canvas></div>
+                            </div>
+                            <div class="col-lg-6">
+                                <h6 class="text-center">% positivas y % conversión por ejecutivo</h6>
+                                <div style="position:relative;height:300px"><canvas id="segBancoChartEfectividad"></canvas></div>
+                            </div>
+                        </div>
+
+                        <div class="seg-dt-wrap">
+                            <table class="table table-sm table-bordered table-hover" id="tablaSegBancoEfectividad" style="width:100%">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th>#</th>
+                                        <th>Ejecutivo</th>
+                                        <th title="Solicitudes asignadas en el rango">Asig.</th>
+                                        <th title="Solicitudes con al menos una respuesta">Resp.</th>
+                                        <th>% resp.</th>
+                                        <th title="Sin respuesta y solicitud activa, asignada hace más de 24 h">Pend. &gt;24h</th>
+                                        <th>Aprob.</th>
+                                        <th>Preaprob.</th>
+                                        <th>Condic.</th>
+                                        <th>Rechaz.</th>
+                                        <th>% positivas</th>
+                                        <th>Selecc.</th>
+                                        <th>% conv.</th>
+                                        <th>Cierres</th>
+                                        <th title="Horas desde la asignación hasta la primera respuesta">1ª resp. prom. (h)</th>
+                                        <th>1ª resp. mediana (h)</th>
+                                        <th title="Promedio sobre respuestas positivas">Tasa prom.</th>
+                                        <th title="Promedio sobre respuestas positivas">Monto prom.</th>
+                                        <th title="Promedio sobre respuestas positivas">Plazo prom.</th>
+                                        <th>Reeval.</th>
+                                    </tr>
+                                </thead>
+                                <tbody><tr><td colspan="20" class="text-center text-muted">Cargando…</td></tr></tbody>
+                                <tfoot class="table-light fw-semibold"></tfoot>
+                            </table>
                         </div>
                     </div>
                 </div>

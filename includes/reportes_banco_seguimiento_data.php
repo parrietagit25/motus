@@ -219,6 +219,222 @@ function rep_segbanco_enriquecer(array $row): array
     return $row;
 }
 
+const REP_SEGBANCO_POSITIVAS = ['aprobado', 'preaprobado', 'aprobado_condicional'];
+const REP_SEGBANCO_ESTADOS_FINALES = ['Rechazada', 'Completada', 'Desistimiento'];
+/** Mínimo de solicitudes respondidas para competir en los destacados por porcentaje o tiempo. */
+const REP_SEGBANCO_MIN_DESTACADO = 5;
+
+/**
+ * Una fila por asignación activa (ejecutivo × solicitud) de la entidad, con su actividad de respuesta.
+ *
+ * @return list<array<string,mixed>>
+ */
+function rep_segbanco_fetch_asignaciones(PDO $pdo, int $bancoId, string $d1, string $d2): array
+{
+    $sqlReeval = rep_fin_columna_existe($pdo, 'evaluaciones_banco', 'fecha_solicitud_reevaluacion')
+        ? 'SUM(e.fecha_solicitud_reevaluacion IS NOT NULL)'
+        : '0';
+    $sql = "
+        SELECT ubs.id AS ubs_id,
+               u.id AS usuario_id,
+               TRIM(CONCAT(COALESCE(u.nombre, ''), ' ', COALESCE(u.apellido, ''))) AS ejecutivo,
+               ubs.fecha_asignacion,
+               sc.id AS solicitud_id,
+               sc.estado AS solicitud_estado,
+               ev.n_resp, ev.primera_resp, ev.n_reeval,
+               le.decision AS ultima_decision, le.tasa_bancaria, le.valor_financiar, le.plazo,
+               CASE WHEN sc.evaluacion_seleccionada IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM evaluaciones_banco es
+                   WHERE es.id = sc.evaluacion_seleccionada AND es.usuario_banco_id = ubs.id
+               ) THEN 1 ELSE 0 END AS es_seleccionada
+        FROM usuarios_banco_solicitudes ubs
+        INNER JOIN usuarios u ON u.id = ubs.usuario_banco_id
+        INNER JOIN solicitudes_credito sc ON sc.id = ubs.solicitud_id
+        LEFT JOIN (
+            SELECT e.usuario_banco_id, COUNT(*) AS n_resp, MIN(e.fecha_evaluacion) AS primera_resp, {$sqlReeval} AS n_reeval
+            FROM evaluaciones_banco e
+            GROUP BY e.usuario_banco_id
+        ) ev ON ev.usuario_banco_id = ubs.id
+        LEFT JOIN (
+            SELECT e.usuario_banco_id, e.decision, e.tasa_bancaria, e.valor_financiar, e.plazo,
+                   ROW_NUMBER() OVER (PARTITION BY e.usuario_banco_id ORDER BY e.fecha_evaluacion DESC, e.id DESC) AS rn
+            FROM evaluaciones_banco e
+        ) le ON le.usuario_banco_id = ubs.id AND le.rn = 1
+        WHERE u.banco_id = :banco_id
+          AND ubs.estado = 'activo'
+          AND (
+            (ubs.fecha_asignacion IS NOT NULL AND DATE(ubs.fecha_asignacion) BETWEEN :d1a AND :d2a)
+            OR (sc.fecha_creacion IS NOT NULL AND DATE(sc.fecha_creacion) BETWEEN :d1b AND :d2b)
+          )
+    ";
+    $st = $pdo->prepare($sql);
+    $st->execute(['banco_id' => $bancoId, 'd1a' => $d1, 'd2a' => $d2, 'd1b' => $d1, 'd2b' => $d2]);
+
+    return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+}
+
+/** @return array<string,mixed> */
+function rep_segbanco_efectividad_vacia(int $usuarioId, string $ejecutivo): array
+{
+    return [
+        'usuario_id' => $usuarioId, 'ejecutivo' => $ejecutivo,
+        'asignadas' => 0, 'respondidas' => 0, 'respuestas_total' => 0, 'sin_respuesta' => 0, 'pendientes_24h' => 0,
+        'aprobado' => 0, 'preaprobado' => 0, 'aprobado_condicional' => 0, 'rechazado' => 0, 'positivas' => 0,
+        'seleccionadas' => 0, 'cierres' => 0, 'reevaluaciones' => 0,
+        '_horas' => [], '_tasa' => [], '_monto' => [], '_plazo' => [],
+    ];
+}
+
+/**
+ * @param array<string,mixed> $a
+ * @return array<string,mixed>
+ */
+function rep_segbanco_efectividad_cerrar(array $a): array
+{
+    $pct = static fn (int $n, int $d): ?float => $d > 0 ? round($n * 100 / $d, 1) : null;
+    $prom = static fn (array $v): ?float => $v ? round(array_sum($v) / count($v), 2) : null;
+    $mediana = static function (array $v): ?float {
+        if (!$v) {
+            return null;
+        }
+        sort($v);
+        $n = count($v);
+        $m = intdiv($n, 2);
+        return round($n % 2 ? $v[$m] : ($v[$m - 1] + $v[$m]) / 2, 1);
+    };
+    $a['aprob_preaprob'] = $a['aprobado'] + $a['preaprobado'];
+    $a['pct_respuesta'] = $pct($a['respondidas'], $a['asignadas']);
+    $a['pct_positivas'] = $pct($a['positivas'], $a['respondidas']);
+    $a['pct_rechazo'] = $pct($a['rechazado'], $a['respondidas']);
+    $a['pct_conversion'] = $pct($a['seleccionadas'], $a['respondidas']);
+    $a['pct_seleccion_positivas'] = $pct($a['seleccionadas'], $a['positivas']);
+    $a['horas_promedio'] = $a['_horas'] ? round(array_sum($a['_horas']) / count($a['_horas']), 1) : null;
+    $a['horas_mediana'] = $mediana($a['_horas']);
+    $a['tasa_promedio'] = $prom($a['_tasa']);
+    $a['monto_promedio'] = $prom($a['_monto']);
+    $a['plazo_promedio'] = $a['_plazo'] ? round(array_sum($a['_plazo']) / count($a['_plazo']), 0) : null;
+    unset($a['_horas'], $a['_tasa'], $a['_monto'], $a['_plazo']);
+
+    return $a;
+}
+
+/**
+ * Efectividad por ejecutivo (analista del banco) y totales de la entidad en el rango.
+ * Decisión = última respuesta del ejecutivo en cada solicitud; positivas = aprobado, preaprobado o aprobado condicional.
+ *
+ * @return array{ejecutivos:list<array<string,mixed>>,totales:array<string,mixed>,destacados:array<string,mixed>}
+ */
+function rep_segbanco_efectividad(PDO $pdo, int $bancoId, string $d1, string $d2): array
+{
+    $porEjecutivo = [];
+    $total = rep_segbanco_efectividad_vacia(0, 'Total banco');
+    $ahora = time();
+
+    foreach (rep_segbanco_fetch_asignaciones($pdo, $bancoId, $d1, $d2) as $r) {
+        $uid = (int) $r['usuario_id'];
+        if (!isset($porEjecutivo[$uid])) {
+            $porEjecutivo[$uid] = rep_segbanco_efectividad_vacia($uid, (string) $r['ejecutivo']);
+        }
+        foreach ([&$porEjecutivo[$uid], &$total] as &$a) {
+            $a['asignadas']++;
+            $nResp = (int) ($r['n_resp'] ?? 0);
+            $asignTs = !empty($r['fecha_asignacion']) ? strtotime((string) $r['fecha_asignacion']) : false;
+            if ($nResp > 0) {
+                $a['respondidas']++;
+                $a['respuestas_total'] += $nResp;
+                $dec = (string) ($r['ultima_decision'] ?? '');
+                if (isset($a[$dec])) {
+                    $a[$dec]++;
+                }
+                if (in_array($dec, REP_SEGBANCO_POSITIVAS, true)) {
+                    $a['positivas']++;
+                    if ($r['tasa_bancaria'] !== null && (float) $r['tasa_bancaria'] > 0) {
+                        $a['_tasa'][] = (float) $r['tasa_bancaria'];
+                    }
+                    if ($r['valor_financiar'] !== null && (float) $r['valor_financiar'] > 0) {
+                        $a['_monto'][] = (float) $r['valor_financiar'];
+                    }
+                    if ($r['plazo'] !== null && (int) $r['plazo'] > 0) {
+                        $a['_plazo'][] = (int) $r['plazo'];
+                    }
+                }
+                $primeraTs = !empty($r['primera_resp']) ? strtotime((string) $r['primera_resp']) : false;
+                if ($asignTs && $primeraTs && $primeraTs >= $asignTs) {
+                    $a['_horas'][] = ($primeraTs - $asignTs) / 3600;
+                }
+            } else {
+                $a['sin_respuesta']++;
+                if ($asignTs && ($ahora - $asignTs) > 86400
+                    && !in_array((string) $r['solicitud_estado'], REP_SEGBANCO_ESTADOS_FINALES, true)) {
+                    $a['pendientes_24h']++;
+                }
+            }
+            if (!empty($r['es_seleccionada'])) {
+                $a['seleccionadas']++;
+                if ((string) $r['solicitud_estado'] === 'Completada') {
+                    $a['cierres']++;
+                }
+            }
+            $a['reevaluaciones'] += (int) ($r['n_reeval'] ?? 0);
+        }
+        unset($a);
+    }
+
+    $ejecutivos = array_map('rep_segbanco_efectividad_cerrar', array_values($porEjecutivo));
+    usort($ejecutivos, static fn ($x, $y) => [$y['aprob_preaprob'], $y['positivas'], $y['respondidas']] <=> [$x['aprob_preaprob'], $x['positivas'], $x['respondidas']]);
+
+    $mejor = static function (array $lista, string $campo, bool $mayor, bool $conMinimo) {
+        $cands = array_filter($lista, static fn ($e) => $e[$campo] !== null && (!$conMinimo || $e['respondidas'] >= REP_SEGBANCO_MIN_DESTACADO)
+            && ($campo !== 'aprob_preaprob' || $e['aprob_preaprob'] > 0));
+        if (!$cands) {
+            return null;
+        }
+        usort($cands, static fn ($x, $y) => $mayor ? $y[$campo] <=> $x[$campo] : $x[$campo] <=> $y[$campo]);
+        $e = reset($cands);
+        return ['ejecutivo' => $e['ejecutivo'], 'valor' => $e[$campo]];
+    };
+
+    return [
+        'ejecutivos' => $ejecutivos,
+        'totales' => rep_segbanco_efectividad_cerrar($total),
+        'destacados' => [
+            'mas_aprobaciones' => $mejor($ejecutivos, 'aprob_preaprob', true, false),
+            'mejor_pct_positivas' => $mejor($ejecutivos, 'pct_positivas', true, true),
+            'mejor_conversion' => $mejor($ejecutivos, 'pct_conversion', true, true),
+            'mas_rapido' => $mejor($ejecutivos, 'horas_mediana', false, true),
+            'minimo_respondidas' => REP_SEGBANCO_MIN_DESTACADO,
+        ],
+    ];
+}
+
+/**
+ * @return array{headers:list<string>,rows:list<list<string|int|float|null>>}
+ */
+function rep_segbanco_export_efectividad_pack(PDO $pdo, int $bancoId): array
+{
+    $filt = rep_segbanco_parse_filtros();
+    [$d1, $d2] = rep_fin_rango_fechas_efectivo($filt['desde'], $filt['hasta']);
+    $ef = rep_segbanco_efectividad($pdo, $bancoId, $d1, $d2);
+    $headers = [
+        'Ejecutivo', 'Asignadas', 'Respondidas', '% respuesta', 'Sin respuesta', 'Pendientes > 24 h',
+        'Aprobadas', 'Preaprobadas', 'Aprob. + preaprob.', 'Aprob. condicionales', 'Rechazadas', '% positivas', '% rechazo',
+        'Seleccionadas', '% conversión', '% seleccionadas de positivas', 'Cierres (Completada)',
+        'Horas 1ª respuesta (prom.)', 'Horas 1ª respuesta (mediana)', 'Tasa prom. %', 'Monto prom. aprobado', 'Plazo prom. (meses)',
+        'Reevaluaciones solicitadas', 'Respuestas registradas',
+    ];
+    $fila = static fn (array $e): array => [
+        $e['ejecutivo'], $e['asignadas'], $e['respondidas'], $e['pct_respuesta'], $e['sin_respuesta'], $e['pendientes_24h'],
+        $e['aprobado'], $e['preaprobado'], $e['aprob_preaprob'], $e['aprobado_condicional'], $e['rechazado'], $e['pct_positivas'], $e['pct_rechazo'],
+        $e['seleccionadas'], $e['pct_conversion'], $e['pct_seleccion_positivas'], $e['cierres'],
+        $e['horas_promedio'], $e['horas_mediana'], $e['tasa_promedio'], $e['monto_promedio'], $e['plazo_promedio'],
+        $e['reevaluaciones'], $e['respuestas_total'],
+    ];
+    $rows = array_map($fila, $ef['ejecutivos']);
+    $rows[] = $fila($ef['totales']);
+
+    return ['headers' => $headers, 'rows' => $rows];
+}
+
 /**
  * @return array<string,mixed>
  */
@@ -251,7 +467,15 @@ function rep_segbanco_build_reporte(PDO $pdo, int $bancoId): array
         $filas[] = $e;
     }
 
+    try {
+        $efectividad = rep_segbanco_efectividad($pdo, $bancoId, $d1, $d2);
+    } catch (PDOException $e) {
+        error_log('rep_segbanco_efectividad: ' . $e->getMessage());
+        $efectividad = null;
+    }
+
     return [
+        'efectividad' => $efectividad,
         'success' => true,
         'filtros' => array_merge($filt, ['fecha_desde' => $d1, 'fecha_hasta' => $d2, 'banco_id' => $bancoId]),
         'kpis' => [

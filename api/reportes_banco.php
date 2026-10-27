@@ -69,6 +69,13 @@ if ($action === 'exportar_excel_seguimiento') {
     exit();
 }
 
+if ($action === 'exportar_excel_efectividad') {
+    require_once __DIR__ . '/../includes/xlsx_export.php';
+    $exp = rep_segbanco_export_efectividad_pack($pdo, $bancoId);
+    motus_output_xlsx_download('efectividad_ejecutivos_banco.xlsx', 'Efectividad', $exp['headers'], $exp['rows']);
+    exit();
+}
+
 header('Content-Type: application/json; charset=utf-8');
 
 switch ($action) {
